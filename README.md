@@ -24,6 +24,32 @@ LoRaWAN.
 
 Standards and clause references are listed in [PROVENANCE.md](PROVENANCE.md).
 
+## Choosing a SCHC implementation
+
+No other Go implementation of SCHC was found (GitHub and the Go module
+proxy, October 2026). The other open implementations are in Python and
+C; compared from their repositories at the versions named. Check the
+projects themselves before relying on a row.
+
+| | this module | openschc (Python) | microSCHC 0.22.0 (Python) | libschc (C) |
+|---|---|---|---|---|
+| Version looked at | v0.x | master, last commit 2025-12-16 (PyPI 0.0.3 is from 2022) | PyPI, 2026-03-02 | master, last commit 2023-04-28 |
+| Licence | Apache-2.0 | MIT | MIT | GPL-3.0, or a commercial licence |
+| Compression of IPv6 and UDP | yes | yes | yes, and IPv4, SCTP | yes |
+| CoAP fields (RFC 8824) | no | yes | yes | yes |
+| IEC 62056-4-7 wrapper (DLMS/COSEM) fields | yes | no | no | no |
+| Fragmentation: No-ACK, ACK-Always, ACK-on-Error | yes | yes | no | yes |
+| LoRaWAN | the RFC 9011 profile: FPort mapping, timers, AES-CMAC interface identifier | examples carry the rule ID in FPort; no AES-CMAC identifier found | no | a LoRaWAN profile in its rule headers; no AES-CMAC identifier found |
+| Rules as YANG / CORECONF | no (own JSON) | yes | no (own data model) | no (C headers) |
+| V.44 compression | yes | no | no | no |
+| Runs in a Go program without cgo | yes | no | no | no |
+
+Pick this module for a Go server that receives DLMS/COSEM or other
+UDP/IPv6 traffic over LoRaWAN. Pick openschc when you need CoAP rules,
+YANG/CORECONF rule management or its network simulator, and Python is
+fine; microSCHC for compression alone on MicroPython; libschc on a
+microcontroller, if GPL-3.0 or its commercial licence suits you.
+
 ## Install
 
 ```
