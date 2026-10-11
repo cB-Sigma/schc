@@ -1,5 +1,52 @@
 # Changelog
 
+## v0.3.0 (2026-10-12)
+
+Packets exchanged with openschc and with the RFC 9442 authors' Sigfox
+code, and the profile, token and rule gaps of v0.2.0 closed. The API only
+grows; code written for v0.2 builds unchanged.
+
+### Added
+
+- Sigfox profile (RFC 9442): `SigfoxUplinkRule` in the single-byte and
+  both two-byte header layouts (`SigfoxHeader`), `SigfoxUplinkNoAckRule`,
+  `SigfoxDownlinkRule`, `SigfoxDownlinkPayload`, `SigfoxUplinkMTU`,
+  `SigfoxDownlinkMTU`.
+- Fragmentation options any rule may use (`FragParams`): `HeaderPadded`,
+  `BitmapUncompressed`, `NoAckReq`, `FCNCountdown`, `FullFragments`,
+  `AckMaxBits`; the fragment-count RCS `RCSFragmentCount` (its size from
+  `rcsSize`); ACK-Always without W for a packet of one window.
+- `penultimateShort` now works: a last tile shorter than an L2 Word takes
+  a word from the penultimate tile, and the receiver reads a fragment both
+  ways and lets the RCS decide (as openschc sends).
+- CoAP extended token lengths (RFC 8974): `coap.tkl` of 4, 12 or 20 bits
+  with the "tkl" length function reading all of it; TKL 9 to 12 accepted.
+- Implicit rules: `Rule.Implicit` (RuleID length 0), and RFC 9363
+  rule-id-length 0 read and written.
+- IPv4 (`ipv4.*`, options as one field, `ipv4.ds`/`ipv4.ecn`) and the SCTP
+  common header (`sctp.*`), stacks such as `ipv4/udp/coap` and
+  `ipv4/sctp`, with IHL, Total Length and the IPv4, UDP-over-IPv4 and SCTP
+  CRC32c checksums computed; IPv4 addresses as target values.
+- Extension module revision `cb-sigma-schc@2026-10-12` (YANG and SID
+  file) with the IPv4 and SCTP identities; the 2026-10-11 revision it
+  replaces is a subset with the same SIDs.
+- `interop/`: a separate test module that runs openschc, schc-over-sigfox
+  and scapy in Docker (`SIGMA_SCHC_INTEROP=1`).
+
+### Fixed
+
+- The ACK-on-Error receiver failed packets whose last fragment ends in a
+  short penultimate tile and a last tile (openschc's downlink case).
+- With `noAckReq` the sender answers a window's ACK by resending its
+  tiles only, and asks with the All-1, not an ACK REQ.
+- A last tile too long to sit beside the RCS in the All-1 now goes in a
+  regular fragment with the All-1 after it, instead of failing.
+
+### Changed
+
+- No-ACK builds every fragment before returning them; an MTU too small
+  for a tile now returns no fragments rather than the ones made so far.
+
 ## v0.2.0 (2026-10-11)
 
 Every "no" in the v0.1 feature table and every row where openschc or

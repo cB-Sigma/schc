@@ -1,0 +1,54 @@
+{
+  "ietf-sid-file:sid-file": {
+    "module-name": "cb-sigma-schc",
+    "module-revision": "2026-10-12",
+    "description": "SIDs of github.com/cB-Sigma/schc's extension identities, from the experimental range of RFC 9595 (not registered).",
+    "assignment-range": [
+      {
+        "entry-point": "60000",
+        "size": "100"
+      }
+    ],
+    "item": [
+      { "namespace": "module", "identifier": "cb-sigma-schc", "sid": "60000" },
+      { "namespace": "identity", "identifier": "fid-coap-option-echo", "sid": "60001" },
+      { "namespace": "identity", "identifier": "fid-coap-option-edhoc", "sid": "60002" },
+      { "namespace": "identity", "identifier": "fid-coap-option-hop-limit", "sid": "60003" },
+      { "namespace": "identity", "identifier": "fid-coap-option-ocf-accept-content-format-version", "sid": "60004" },
+      { "namespace": "identity", "identifier": "fid-coap-option-ocf-content-format-version", "sid": "60005" },
+      { "namespace": "identity", "identifier": "fid-coap-option-q-block1", "sid": "60006" },
+      { "namespace": "identity", "identifier": "fid-coap-option-q-block2", "sid": "60007" },
+      { "namespace": "identity", "identifier": "fid-coap-option-request-tag", "sid": "60008" },
+      { "namespace": "identity", "identifier": "fid-wrapper-app-wport", "sid": "60009" },
+      { "namespace": "identity", "identifier": "fid-wrapper-base-type", "sid": "60010" },
+      { "namespace": "identity", "identifier": "fid-wrapper-dev-wport", "sid": "60011" },
+      { "namespace": "identity", "identifier": "fid-wrapper-length", "sid": "60012" },
+      { "namespace": "identity", "identifier": "fid-wrapper-version", "sid": "60013" },
+      { "namespace": "identity", "identifier": "fl-variable-bits", "sid": "60014" },
+      { "namespace": "identity", "identifier": "rcs-crc16-hdlc", "sid": "60015" },
+      { "namespace": "identity", "identifier": "rcs-crc32c", "sid": "60016" },
+      { "namespace": "identity", "identifier": "rcs-crc8", "sid": "60017" },
+      { "namespace": "identity", "identifier": "fid-ipv4-base-type", "sid": "60018" },
+      { "namespace": "identity", "identifier": "fid-ipv4-version", "sid": "60019" },
+      { "namespace": "identity", "identifier": "fid-ipv4-ihl", "sid": "60020" },
+      { "namespace": "identity", "identifier": "fid-ipv4-tos", "sid": "60021" },
+      { "namespace": "identity", "identifier": "fid-ipv4-tos-ds", "sid": "60022" },
+      { "namespace": "identity", "identifier": "fid-ipv4-tos-ecn", "sid": "60023" },
+      { "namespace": "identity", "identifier": "fid-ipv4-total-length", "sid": "60024" },
+      { "namespace": "identity", "identifier": "fid-ipv4-identification", "sid": "60025" },
+      { "namespace": "identity", "identifier": "fid-ipv4-flags", "sid": "60026" },
+      { "namespace": "identity", "identifier": "fid-ipv4-fragment-offset", "sid": "60027" },
+      { "namespace": "identity", "identifier": "fid-ipv4-ttl", "sid": "60028" },
+      { "namespace": "identity", "identifier": "fid-ipv4-protocol", "sid": "60029" },
+      { "namespace": "identity", "identifier": "fid-ipv4-checksum", "sid": "60030" },
+      { "namespace": "identity", "identifier": "fid-ipv4-dev-address", "sid": "60031" },
+      { "namespace": "identity", "identifier": "fid-ipv4-app-address", "sid": "60032" },
+      { "namespace": "identity", "identifier": "fid-ipv4-options", "sid": "60033" },
+      { "namespace": "identity", "identifier": "fid-sctp-base-type", "sid": "60034" },
+      { "namespace": "identity", "identifier": "fid-sctp-dev-port", "sid": "60035" },
+      { "namespace": "identity", "identifier": "fid-sctp-app-port", "sid": "60036" },
+      { "namespace": "identity", "identifier": "fid-sctp-verification-tag", "sid": "60037" },
+      { "namespace": "identity", "identifier": "fid-sctp-checksum", "sid": "60038" }
+    ]
+  }
+}

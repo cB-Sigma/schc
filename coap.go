@@ -26,7 +26,7 @@ import (
 const (
 	FCoAPVersion    = "coap.version"    // 2 bits
 	FCoAPType       = "coap.type"       // 2 bits
-	FCoAPTKL        = "coap.tkl"        // 4 bits
+	FCoAPTKL        = "coap.tkl"        // 4 bits, or 12 or 20 with the extended length of RFC 8974
 	FCoAPCode       = "coap.code"       // 8 bits
 	FCoAPCodeClass  = "coap.codeClass"  // first 3 bits of the code, when a rule describes them apart
 	FCoAPCodeDetail = "coap.codeDetail" // last 5 bits of the code
@@ -147,7 +147,7 @@ func isCoAPFID(fid string) bool {
 
 // knownFID reports whether some layer labels fid.
 func knownFID(fid string) bool {
-	if _, ok := fieldLengths[fid]; ok {
+	if _, ok := fieldLengths[fid]; ok || variableFIDs[fid] {
 		return true
 	}
 	if _, ok := subfieldOf[fid]; ok {
@@ -169,22 +169,31 @@ func parseCoAP(b []byte, inner bool, add func(fid string, v Bits)) ([]byte, erro
 		if len(b) < 4 || b[0]>>6 != 1 {
 			return nil, errNotStack
 		}
-		tkl := int(b[0] & 0x0F)
-		if tkl > 8 || len(b) < 4+tkl {
-			// TKL 9 to 15 are reserved (RFC 7252 3); the extended token
-			// lengths of RFC 8974 are not labelled.
+		// The token length (RFC 8974 2.1): the TKL nibble, then for 13 and
+		// 14 one or two bytes after the header. SCHC takes nibble and
+		// extension as one TKL field of 4, 12 or 20 bits
+		// (draft-ietf-schc-8824-update 4.3).
+		ext := extLen[b[0]&0x0F]
+		if b[0]&0x0F == 15 || len(b) < 4+ext {
+			return nil, errNotStack
+		}
+		var tklField Bits
+		tklField.AppendUint(uint64(b[0]&0x0F), 4)
+		tklField.AppendBytes(b[4 : 4+ext])
+		tkl, _ := tokenLength(tklField)
+		if len(b) < 4+ext+tkl {
 			return nil, errNotStack
 		}
 		h := BytesOf(b[0:4])
 		add(FCoAPVersion, h.Slice(0, 2))
 		add(FCoAPType, h.Slice(2, 4))
-		add(FCoAPTKL, h.Slice(4, 8))
+		add(FCoAPTKL, tklField.Clone())
 		add(FCoAPCode, h.Slice(8, 16))
 		add(FCoAPMID, h.Slice(16, 32))
 		if tkl > 0 {
-			add(FCoAPToken, BytesOf(append([]byte(nil), b[4:4+tkl]...)))
+			add(FCoAPToken, BytesOf(append([]byte(nil), b[4+ext:4+ext+tkl]...)))
 		}
-		b = b[4+tkl:]
+		b = b[4+ext+tkl:]
 	}
 	var num uint32
 	for len(b) > 0 {
@@ -223,6 +232,30 @@ func parseCoAP(b []byte, inner bool, add func(fid string, v Bits)) ([]byte, erro
 		add(CoAPOptionFID(num), BytesOf(v))
 	}
 	return nil, nil
+}
+
+// extLen is the number of bytes of extended token length after the CoAP
+// header for each TKL nibble (RFC 8974 2.1).
+var extLen = [16]int{13: 1, 14: 2}
+
+// tokenLength is the token length in bytes a TKL field of 4, 12 or 20
+// bits gives (RFC 8974 2.1: nibble 13 adds 13 to the byte after it, 14
+// adds 269 to the two); ok is false for a field of another size or a
+// nibble of 15.
+func tokenLength(tkl Bits) (int, bool) {
+	if tkl.Len() < 4 {
+		return 0, false
+	}
+	n := tkl.UintAt(0, 4)
+	switch {
+	case n == 13 && tkl.Len() == 12:
+		return 13 + int(tkl.UintAt(4, 8)), true
+	case n == 14 && tkl.Len() == 20:
+		return 269 + int(tkl.UintAt(4, 16)), true
+	case n < 13 && tkl.Len() == 4:
+		return int(n), true
+	}
+	return 0, false
 }
 
 // optExt reads an option delta or length nibble's extension (RFC 7252 3.1).
@@ -349,14 +382,30 @@ func buildCoAP(fields []Field, payload []byte, inner bool) ([]byte, error) {
 			}
 		}
 	} else {
-		for _, fid := range []string{FCoAPVersion, FCoAPType, FCoAPTKL, FCoAPCode, FCoAPMID} {
+		tklField, ok := one[FCoAPTKL]
+		if !ok {
+			return nil, fmt.Errorf("schc: field %s has no value", FCoAPTKL)
+		}
+		tkl, ok := tokenLength(tklField)
+		if !ok {
+			return nil, fmt.Errorf("schc: field %s of %d bits is not a token length (RFC 8974)", FCoAPTKL, tklField.Len())
+		}
+		for _, fid := range []string{FCoAPVersion, FCoAPType} {
 			v, err := get(fid)
 			if err != nil {
 				return nil, err
 			}
 			h.Append(v)
 		}
-		tkl := int(one[FCoAPTKL].UintAt(0, 4))
+		h.Append(tklField.Slice(0, 4))
+		for _, fid := range []string{FCoAPCode, FCoAPMID} {
+			v, err := get(fid)
+			if err != nil {
+				return nil, err
+			}
+			h.Append(v)
+		}
+		h.Append(tklField.Slice(4, tklField.Len())) // the extended length, if any
 		tok := one[FCoAPToken]
 		if tok.Len() != 8*tkl {
 			return nil, fmt.Errorf("schc: the token has %d bits and TKL says %d bytes", tok.Len(), tkl)

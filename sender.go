@@ -84,6 +84,15 @@ func (s *Sender) cutTiles(ts int) error {
 	for i := 0; i < packet.Len(); i += ts {
 		s.tiles = append(s.tiles, packet.Slice(i, min(i+ts, packet.Len())))
 	}
+	if n := len(s.tiles); p.PenultimateShort && n >= 2 && s.tiles[n-1].Len() < word {
+		// A last tile shorter than an L2 Word takes a word from the
+		// penultimate tile, which is then one L2 Word short (RFC 8724
+		// 8.4.3.1); the last tile can then travel in a regular fragment,
+		// as openschc sends it.
+		both := s.tiles[n-2].Clone()
+		both.Append(s.tiles[n-1])
+		s.tiles[n-2], s.tiles[n-1] = both.Slice(0, ts-word), both.Slice(ts-word, both.Len())
+	}
 	if len(s.tiles) > (1<<uint(p.WSize))*p.WindowSize {
 		return fmt.Errorf("schc: %d tiles do not fit in %d windows of %d (RFC 8724 8.4.3.1)", len(s.tiles), 1<<uint(p.WSize), p.WindowSize)
 	}
@@ -149,7 +158,37 @@ func (s *Sender) headerBits(all1 bool) int {
 	if all1 {
 		h += s.p.RCSSize
 	}
+	if s.p.HeaderPadded {
+		h += padOf(h, s.word)
+	}
 	return h
+}
+
+// rcsFor is the All-1's RCS: the check over the packet and the padding of
+// the fragment that carried its last tile, or, with RCSFragmentCount, the
+// fragment count given.
+func (s *Sender) rcsFor(pad, count int) uint32 {
+	if s.p.countRCS() {
+		return uint32(count) & (1<<uint(s.p.RCSSize) - 1)
+	}
+	return s.rcsWith(pad)
+}
+
+// all1Win is the All-1's window and, for RCSFragmentCount, the number of
+// fragments of that window with the All-1. The All-1 takes the place after
+// the last tile; when that tile ends a window and the count is sent, the
+// All-1 opens the next window alone, as the Sigfox profile's sender does.
+func (s *Sender) all1Win() (w uint32, count int) {
+	ws := s.p.WindowSize
+	last := len(s.tiles) - 1
+	w, pos := uint32(last/ws), last%ws
+	switch {
+	case s.lastInAll:
+		return w, pos + 1
+	case pos+1 < ws || !s.p.countRCS():
+		return w, pos + 2
+	}
+	return w + 1, 1
 }
 
 func padOf(n, word int) int { return (word - n%word) % word }
@@ -182,6 +221,20 @@ func (s *Sender) Start(now time.Time, mtu int) ([]Bits, error) {
 				return s.fail(err), err
 			}
 		}
+		if lt := s.tiles[len(s.tiles)-1]; s.lastInAll && s.headerBits(true)+lt.Len() > mtu && lt.Len() >= s.word {
+			// The last tile does not fit beside the RCS: it goes in a
+			// regular fragment and the All-1 follows it alone (as the
+			// Sigfox profile sends a last tile of a whole fragment's size).
+			if _, idx := s.tileWin(len(s.tiles) - 1); idx != 0 || s.p.countRCS() {
+				s.lastInAll = false
+			}
+		}
+		if s.p.countRCS() {
+			if w, _ := s.all1Win(); w >= 1<<uint(s.p.WSize) {
+				err := errors.New("schc: the All-1 would need a window past the last (RFC 8724 8.4.3.1)")
+				return s.fail(err), err
+			}
+		}
 		return s.aoeBlind(now, mtu)
 	}
 }
@@ -200,44 +253,67 @@ func (s *Sender) cut(mtu int) (Bits, error) {
 	// The fragment is whole L2 Words: h + tile = k words.
 	room := mtu/s.word*s.word - h
 	rem := s.packet.Len() - s.pos
-	for room > 0 && room > rem-s.word {
+	for !s.p.FullFragments && room > 0 && room > rem-s.word {
 		room -= s.word
 	}
 	if room < s.word {
 		return Bits{}, fmt.Errorf("schc: an MTU of %d bits leaves no room for a tile", mtu)
 	}
-	t := s.packet.Slice(s.pos, s.pos+room)
-	s.pos += room
+	t := s.packet.Slice(s.pos, s.pos+min(room, rem))
+	s.pos += min(room, rem)
 	return t, nil
 }
 
 // noAck sends every fragment: one tile each, the last in the All-1 with
-// the RCS (RFC 8724 8.4.1.1).
+// the RCS (RFC 8724 8.4.1.1). With FCNCountdown the regular fragments are
+// numbered from the fragment count less one down to 1 (RFC 9442 3.6.1,
+// 5.1).
 func (s *Sender) noAck(mtu0 int) ([]Bits, error) {
-	var out []Bits
+	var tiles []Bits
+	var all1 Bits
+	var pad int
 	for {
 		mtu := s.mtu(mtu0)
 		rem := s.packet.Len() - s.pos
 		if s.headerBits(true)+rem <= mtu {
-			t := s.packet.Slice(s.pos, s.packet.Len())
-			pad := padOf(s.headerBits(true)+rem, s.word)
-			out = append(out, s.enc(&FragMsg{Kind: MsgAll1, W: 0, RCS: s.rcsWith(pad), Payload: t}))
+			all1 = s.packet.Slice(s.pos, s.packet.Len())
+			pad = padOf(s.headerBits(true)+rem, s.word)
 			s.pos = s.packet.Len()
-			s.done = true
-			return out, nil
+			break
 		}
 		t, err := s.cut(mtu)
 		if err != nil {
 			s.done, s.err = true, err
-			return out, err
+			return nil, err
 		}
-		out = append(out, s.enc(&FragMsg{Kind: MsgFragment, FCN: 0, Payload: t}))
+		tiles = append(tiles, t)
 	}
+	n := len(tiles) + 1
+	if s.p.FCNCountdown && n-1 >= int(s.p.all1()) {
+		err := fmt.Errorf("schc: %d fragments do not fit a %d-bit FCN counting down", n, s.p.FCNSize)
+		s.done, s.err = true, err
+		return nil, err
+	}
+	out := make([]Bits, 0, n)
+	for i, t := range tiles {
+		fcn := uint32(0)
+		if s.p.FCNCountdown {
+			fcn = uint32(n - 1 - i)
+		}
+		out = append(out, s.enc(&FragMsg{Kind: MsgFragment, FCN: fcn, Payload: t}))
+	}
+	out = append(out, s.enc(&FragMsg{Kind: MsgAll1, W: 0, RCS: s.rcsFor(pad, n), Payload: all1}))
+	s.done = true
+	return out, nil
 }
 
 // blindWindow sends the current window of ACK-Always, one tile per
 // fragment, and arms the retransmission timer (RFC 8724 8.4.2.1).
 func (s *Sender) blindWindow(now time.Time, mtu int) ([]Bits, error) {
+	if s.p.WSize == 0 && s.win > 0 {
+		err := errors.New("schc: the packet does not fit in the one window of a rule without W")
+		return s.fail(err), err
+	}
 	s.winTile = s.winTile[:0]
 	s.attempts = 0
 	var out []Bits
@@ -251,7 +327,7 @@ func (s *Sender) blindWindow(now time.Time, mtu int) ([]Bits, error) {
 			s.pos = s.packet.Len()
 			pad := padOf(s.headerBits(true)+rem, s.word)
 			s.winTile = append(s.winTile, sentTile{idx: s.p.all1(), bits: t, pad: pad})
-			s.rcsVal = s.rcsWith(pad)
+			s.rcsVal = s.rcsFor(pad, len(s.winTile))
 			out = append(out, s.enc(&FragMsg{Kind: MsgAll1, W: w, RCS: s.rcsVal, Payload: t}))
 			s.last = true
 			break
@@ -375,6 +451,11 @@ func (s *Sender) Tick(now time.Time) ([]Bits, error) {
 	s.timer = now.Add(s.p.Retransmission.D())
 	switch s.p.Mode {
 	case AckAlways:
+		if s.p.NoAckReq && s.last && len(s.winTile) > 0 {
+			// The All-1 again asks for the ACK (RFC 9442 3.6.5.1).
+			t := s.winTile[len(s.winTile)-1]
+			return []Bits{s.enc(&FragMsg{Kind: MsgAll1, W: s.win & 1, RCS: s.rcsVal, Payload: t.bits})}, nil
+		}
 		return []Bits{s.enc(&FragMsg{Kind: MsgAckReq, W: s.win & 1})}, nil
 	case AckOnError:
 		if s.waitWin >= 0 {
@@ -392,10 +473,12 @@ func (s *Sender) tileWin(i int) (w, idx uint32) {
 	return uint32(i / ws), uint32(ws - 1 - i%ws)
 }
 
-func (s *Sender) lastWin() uint32 { w, _ := s.tileWin(len(s.tiles) - 1); return w }
+// all1Count is the fragment count of the All-1's window (RCSFragmentCount).
+func (s *Sender) all1Count() int { _, c := s.all1Win(); return c }
 
 func (s *Sender) all1Msg() Bits {
-	m := &FragMsg{Kind: MsgAll1, W: s.lastWin(), RCS: s.rcsVal}
+	w, _ := s.all1Win()
+	m := &FragMsg{Kind: MsgAll1, W: w, RCS: s.rcsVal}
 	if s.lastInAll {
 		m.Payload = s.tiles[len(s.tiles)-1]
 	}
@@ -430,7 +513,7 @@ func (s *Sender) packTiles(from, to, mtu int, stopAtWindow bool) ([]Bits, error)
 		}
 		if j == len(s.tiles) && !s.lastInAll {
 			s.lastPad = padOf(h+pl.Len(), s.word)
-			s.rcsVal, s.rcsSet = s.rcsWith(s.lastPad), true
+			s.rcsVal, s.rcsSet = s.rcsFor(s.lastPad, s.all1Count()), true
 		}
 		out = append(out, s.enc(&FragMsg{Kind: MsgFragment, W: w, FCN: idx, Payload: pl}))
 		i = j
@@ -446,7 +529,7 @@ func (s *Sender) aoeBlind(now time.Time, mtu int) ([]Bits, error) {
 		n-- // the last tile rides in the All-1
 		if !s.rcsSet {
 			s.lastPad = padOf(s.headerBits(true)+s.tiles[len(s.tiles)-1].Len(), s.word)
-			s.rcsVal, s.rcsSet = s.rcsWith(s.lastPad), true
+			s.rcsVal, s.rcsSet = s.rcsFor(s.lastPad, s.all1Count()), true
 		}
 	}
 	to := n
@@ -479,7 +562,7 @@ func (s *Sender) aoeBlind(now time.Time, mtu int) ([]Bits, error) {
 
 // aoeAck handles an ACK-on-Error SCHC ACK for window m.W.
 func (s *Sender) aoeAck(now time.Time, m *FragMsg, mtu int) ([]Bits, error) {
-	lw := s.lastWin()
+	lw, _ := s.all1Win()
 	reports := append([]WindowBitmap{{W: m.W, Bitmap: m.Bitmap}}, m.More...)
 	for _, r := range reports {
 		if r.W > lw {
@@ -538,12 +621,18 @@ func (s *Sender) aoeAck(now time.Time, m *FragMsg, mtu int) ([]Bits, error) {
 	if !s.all1Sent {
 		return out, nil
 	}
+	if s.p.NoAckReq && !isLast {
+		// An ACK that a window's end asked for (the Sigfox receiver sends
+		// one after an All-0): resend its tiles; the All-1 asks again when
+		// the timer runs out.
+		return out, nil
+	}
 	if s.attempts >= s.p.MaxAckRequests {
 		return append(out, s.fail(errors.New("schc: the packet is still incomplete after MAX_ACK_REQUESTS"))...), s.err
 	}
 	s.attempts++
 	s.timer = now.Add(s.p.Retransmission.D())
-	if all1Missing || (isLast && len(missing) == 0) {
+	if all1Missing || (isLast && len(missing) == 0) || s.p.NoAckReq {
 		return append(out, s.all1Msg()), nil
 	}
 	return append(out, s.enc(&FragMsg{Kind: MsgAckReq, W: lw})), nil

@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package schc is Static Context Header Compression and fragmentation (RFC
-// 8724) for IPv6, UDP, ICMPv6 and CoAP (RFC 8824), with the LoRaWAN
-// profile of RFC 9011, the Compound ACK of RFC 9441 and rules in the RFC
-// 9363 data model.
+// 8724) for IPv6, IPv4, UDP, SCTP, ICMPv6 and CoAP (RFC 8824, with the
+// extended token lengths of RFC 8974), with the LoRaWAN profile of RFC
+// 9011, the Sigfox profile of RFC 9442, the Compound ACK of RFC 9441 and
+// rules in the RFC 9363 data model, implicit rules included.
 //
 // Compression (compress.go): rules of field descriptors (FID, FL, FP, DI,
 // TV, MO, CDA) matched as clause 7.2 says; the matching operators equal,
@@ -35,6 +36,16 @@
 // machines without I/O. With a rule's CompoundAck the ACK-on-Error
 // receiver reports every window with missing tiles in one SCHC Compound
 // ACK and the sender reads it (RFC 9441).
+//
+// IPv4 (RFC 791, options as one field) and the SCTP common header (RFC
+// 9260) are labelled too; compute rebuilds IHL, Total Length, the header
+// checksum, the UDP checksum over IPv4 and the SCTP CRC32c.
+//
+// Sigfox (sigfox.go, RFC 9442): the uplink No-ACK rule, the three uplink
+// ACK-on-Error header layouts with the Compound ACK in 8-byte downlinks,
+// and the downlink ACK-Always rule, built from profile options any rule
+// may use (FragParams: HeaderPadded, the fragment-count RCS,
+// FCNCountdown, FullFragments, NoAckReq, BitmapUncompressed, AckMaxBits).
 //
 // LoRaWAN (lorawan.go): RuleID in the FPort, the uplink ACK-on-Error and
 // downlink ACK-Always rules with their parameters and class timers, the

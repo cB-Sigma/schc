@@ -84,7 +84,13 @@ type RuleSet struct {
 type Rule struct {
 	ID       uint32 `json:"ruleId"`
 	IDLength int    `json:"ruleIdLength,omitempty"` // bits, default 8
-	Kind     string `json:"kind,omitempty"`         // default compression, or fragmentation when fragmentation is set
+	// Implicit is a rule whose RuleID is not sent (length 0): the context
+	// says which rule applies, as when the rule set holds one rule or the
+	// L2 tells rules apart (RFC 9363's rule-id-length 0). Its ID is 0, and
+	// it must be the only rule of its rule set, since an empty RuleID
+	// starts every other.
+	Implicit bool   `json:"implicit,omitempty"`
+	Kind     string `json:"kind,omitempty"` // default compression, or fragmentation when fragmentation is set
 	// Name is a label for logs and the console.
 	Name          string            `json:"name,omitempty"`
 	Fields        []FieldDescriptor `json:"fields,omitempty"`
@@ -160,8 +166,35 @@ type FragParams struct {
 	CompoundAck            bool `json:"compoundAck,omitempty"`
 	LastBitmapUncompressed bool `json:"lastBitmapUncompressed,omitempty"`
 
+	// Options of technology profiles (all off by default; the Sigfox
+	// rules of RFC 9442 set them, see SigfoxUplinkRule):
+	//
+	// HeaderPadded pads every fragment header (an All-1's with its RCS)
+	// to an L2 Word before the payload. BitmapUncompressed sends every ACK bitmap
+	// whole (for a Compound ACK, as LastBitmapUncompressed). NoAckReq has
+	// the sender ask for an ACK by sending the All-1 again, never an ACK
+	// REQ. FCNCountdown numbers No-ACK fragments from the number of
+	// fragments less one down to 1, the last being the All-1.
+	// FullFragments (No-ACK and ACK-Always) fills every regular fragment
+	// to the MTU, so no regular fragment needs padding; a remainder too
+	// long for the All-1 goes in one more regular fragment and the All-1
+	// follows empty.
+	HeaderPadded       bool `json:"headerPadded,omitempty"`
+	BitmapUncompressed bool `json:"bitmapUncompressed,omitempty"`
+	NoAckReq           bool `json:"noAckReq,omitempty"`
+	FCNCountdown       bool `json:"fcnCountdown,omitempty"`
+	FullFragments      bool `json:"fullFragments,omitempty"`
+	// AckMaxBits bounds the receiver's SCHC ACK (the frame it travels in,
+	// 64 bits on a Sigfox downlink): a Compound ACK reports as many
+	// windows with tiles missing as fit, lowest first. 0 is no bound.
+	AckMaxBits int `json:"ackMaxBits,omitempty"`
+
 	rcsAlg RCSAlgorithm
 }
+
+// countRCS reports whether the RCS field carries a fragment count
+// (RCSFragmentCount) rather than a check value over the packet.
+func (p *FragParams) countRCS() bool { return p.RCS == RCSFragmentCount }
 
 // Duration is a JSON duration: "12h", "30s" or a number of seconds.
 type Duration time.Duration
@@ -243,10 +276,14 @@ func (rs *RuleSet) Compile() error {
 }
 
 func (r *Rule) compile(word int) error {
-	if r.IDLength == 0 {
+	if r.Implicit {
+		if r.IDLength != 0 || r.ID != 0 {
+			return errors.New("an implicit rule has no RuleID (ruleId 0, ruleIdLength 0)")
+		}
+	} else if r.IDLength == 0 {
 		r.IDLength = 8
 	}
-	if r.IDLength < 1 || r.IDLength > 32 {
+	if !r.Implicit && (r.IDLength < 1 || r.IDLength > 32) {
 		return fmt.Errorf("ruleIdLength %d is not 1 to 32", r.IDLength)
 	}
 	if uint64(r.ID) >= 1<<uint(r.IDLength) {
@@ -560,6 +597,13 @@ func parseValue(raw json.RawMessage, fl int, text bool) (Bits, error) {
 		if strings.Contains(s, ":") {
 			return ipv6Value(s, fl)
 		}
+		if a, err := netip.ParseAddr(s); err == nil && a.Is4() {
+			if fl != 32 {
+				return Bits{}, fmt.Errorf("an IPv4 address %q is for a 32-bit field", s)
+			}
+			b := a.As4()
+			return BitsOf(b[:], 32).Clone(), nil
+		}
 		s = strings.TrimPrefix(strings.TrimPrefix(s, "0x"), "0X")
 		if len(s)%2 == 1 {
 			s = "0" + s
@@ -662,11 +706,21 @@ func (p *FragParams) compile(word, _ int) error {
 		return fmt.Errorf("rcs %q is not a registered algorithm (%s)", p.RCS, strings.Join(RCSAlgorithms(), ", "))
 	}
 	p.rcsAlg = alg
-	if p.RCSSize == 0 {
-		p.RCSSize = alg.Bits
+	if alg.Bits == 0 {
+		// The fragment count: its size is the rule's.
+		if p.RCSSize < 1 || p.RCSSize > 32 {
+			return fmt.Errorf("rcs %s needs an rcsSize of 1 to 32 bits", alg.Name)
+		}
+	} else {
+		if p.RCSSize == 0 {
+			p.RCSSize = alg.Bits
+		}
+		if p.RCSSize != alg.Bits {
+			return fmt.Errorf("rcsSize %d is not the %d bits of %s", p.RCSSize, alg.Bits, alg.Name)
+		}
 	}
-	if p.RCSSize != alg.Bits {
-		return fmt.Errorf("rcsSize %d is not the %d bits of %s", p.RCSSize, alg.Bits, alg.Name)
+	if p.FCNCountdown && p.Mode != NoAck {
+		return errors.New("fcnCountdown is for no-ack")
 	}
 	if p.TileBytes != 0 {
 		if p.TileSize != 0 && p.TileSize != 8*p.TileBytes {
@@ -698,8 +752,10 @@ func (p *FragParams) compile(word, _ int) error {
 			return errors.New("no-ack has no W field (RFC 8724 8.4.1)")
 		}
 	case AckAlways:
-		if p.WSize != 1 {
-			return errors.New("ack-always has a 1-bit W field (RFC 8724 8.4.2)")
+		if p.WSize > 1 {
+			// RFC 8724 8.4.2 has a 1-bit W; RFC 9442's downlink rule has
+			// none, so the packet must fit in one window.
+			return errors.New("ack-always has a 1-bit W field (RFC 8724 8.4.2), or none for a packet of one window")
 		}
 		if p.WindowSize == 0 {
 			p.WindowSize = 1<<uint(p.FCNSize) - 1

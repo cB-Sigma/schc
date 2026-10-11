@@ -26,6 +26,14 @@ each file:
   coreconf/sid/ietf-schc-oam@2021-11-10.sid: SID assignments, embedded in
   the coreconf package as its default SIDs.
 
+The interop test module (interop/, not part of the library) builds Docker
+images of openschc (MIT, commit 58293f71) and schc-over-sigfox
+(https://github.com/schc-over-sigfox/schc-over-sigfox, MIT, commit
+1ec0b723, "Copyright (c) 2021 schc-over-sigfox"), fetched at build time
+and not redistributed here; the drivers that call them are ours. One
+Compound ACK captured from schc-over-sigfox is a test vector in
+sigfox_decode_internal_test.go.
+
 Dependencies: the schc and schc/v44 packages use only the Go standard
 library. The schc/coreconf package uses github.com/fxamacker/cbor/v2
 (MIT), which uses github.com/x448/float16 (MIT).

@@ -138,7 +138,8 @@ func (r *Rule) compress(st Stack, p Packet, dir Direction, ctx Context) (Bits, b
 			// The token's length is TKL bytes (RFC 8824 4.5): no size is
 			// sent, so the TKL must say it.
 			tkl, found := fieldValue(p, FCoAPTKL)
-			if !found || v.Len() != 8*int(tkl.UintAt(0, tkl.Len())) {
+			n, ok := tokenLength(tkl)
+			if !found || !ok || v.Len() != 8*n {
 				return Bits{}, false
 			}
 		}
@@ -520,10 +521,11 @@ func (r *Rule) decompress(rd *reader, dir Direction, ctx Context, maxSize int) (
 func tklBits(fields []Field) (int, error) {
 	for _, f := range fields {
 		if f.FID == FCoAPTKL {
-			if f.Value.Len() != 4 {
-				return 0, errors.New("the TKL is not 4 bits")
+			n, ok := tokenLength(f.Value)
+			if !ok {
+				return 0, errors.New("the TKL is not a token length of 4, 12 or 20 bits (RFC 8974)")
 			}
-			return 8 * int(f.Value.UintAt(0, 4)), nil
+			return 8 * n, nil
 		}
 	}
 	return 0, errors.New("the rule gives no TKL before the token")

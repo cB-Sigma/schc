@@ -33,8 +33,8 @@ import (
 //
 // Field IDs, field-length functions and RCS algorithms that ietf-schc
 // does not define are written as identities of our module cb-sigma-schc
-// (yang/cb-sigma-schc@2026-10-11.yang in this repository, from the ietf-schc
-// bases): the IEC 62056-4-7 wrapper fields, the CoAP options registered
+// (yang/cb-sigma-schc@2026-10-12.yang in this repository, from the ietf-schc
+// bases): the IEC 62056-4-7 wrapper fields, the IPv4 and SCTP fields, the CoAP options registered
 // after RFC 9363 (Hop-Limit, Q-Block1/2, EDHOC, Echo, Request-Tag, the
 // two OCF options), variable lengths counted in bits and the RCS
 // algorithms besides CRC32. ICMPv6 fields use the identities of the
@@ -82,6 +82,15 @@ var yangFIDs = map[string]string{
 	FCoAPOCFCFVer:       "cb-sigma-schc:fid-coap-option-ocf-content-format-version",
 	FWrapperVersion:     "cb-sigma-schc:fid-wrapper-version", FWrapperDevWPort: "cb-sigma-schc:fid-wrapper-dev-wport",
 	FWrapperAppWPort: "cb-sigma-schc:fid-wrapper-app-wport", FWrapperLength: "cb-sigma-schc:fid-wrapper-length",
+	FIPv4Version: "cb-sigma-schc:fid-ipv4-version", FIPv4IHL: "cb-sigma-schc:fid-ipv4-ihl",
+	FIPv4ToS: "cb-sigma-schc:fid-ipv4-tos", FIPv4DS: "cb-sigma-schc:fid-ipv4-tos-ds", FIPv4ECN: "cb-sigma-schc:fid-ipv4-tos-ecn",
+	FIPv4TotalLength: "cb-sigma-schc:fid-ipv4-total-length", FIPv4Identification: "cb-sigma-schc:fid-ipv4-identification",
+	FIPv4Flags: "cb-sigma-schc:fid-ipv4-flags", FIPv4FragmentOffset: "cb-sigma-schc:fid-ipv4-fragment-offset",
+	FIPv4TTL: "cb-sigma-schc:fid-ipv4-ttl", FIPv4Protocol: "cb-sigma-schc:fid-ipv4-protocol",
+	FIPv4Checksum: "cb-sigma-schc:fid-ipv4-checksum", FIPv4DevAddress: "cb-sigma-schc:fid-ipv4-dev-address",
+	FIPv4AppAddress: "cb-sigma-schc:fid-ipv4-app-address", FIPv4Options: "cb-sigma-schc:fid-ipv4-options",
+	FSCTPDevPort: "cb-sigma-schc:fid-sctp-dev-port", FSCTPAppPort: "cb-sigma-schc:fid-sctp-app-port",
+	FSCTPVerificationTag: "cb-sigma-schc:fid-sctp-verification-tag", FSCTPChecksum: "cb-sigma-schc:fid-sctp-checksum",
 
 	// The ICMPv6 identities of the ietf-schc-oam draft module, as openschc
 	// writes them.
@@ -211,7 +220,7 @@ func (rs *RuleSet) YANG() (*YANGDocument, error) {
 func ptr[T any](v T) *T { return &v }
 
 func (r *Rule) yang(rs *RuleSet) (YANGRule, error) {
-	if r.IDLength == 0 {
+	if r.IDLength == 0 && !r.Implicit {
 		return YANGRule{}, errors.New("the rule set is not compiled")
 	}
 	yr := YANGRule{RuleIDValue: ptr(r.ID), RuleIDLength: ptr(uint8(r.IDLength)), RuleNature: yangKind[r.Kind]}
@@ -260,6 +269,9 @@ func (r *Rule) yang(rs *RuleSet) (YANGRule, error) {
 			return YANGRule{}, fmt.Errorf("inactivity timer: %w", err)
 		}
 		yr.InactivityTimer = t
+		if p.HeaderPadded || p.BitmapUncompressed || p.NoAckReq || p.FCNCountdown || p.FullFragments || p.AckMaxBits > 0 {
+			return YANGRule{}, errors.New("RFC 9363 has no parameters for the profile options (headerPadded, bitmapUncompressed, noAckReq, fcnCountdown, fullFragments, ackMaxBits)")
+		}
 		if p.Mode == AckOnError {
 			if p.TileSize > 255 {
 				return YANGRule{}, fmt.Errorf("a tile of %d bits is over the 255 of RFC 9363's tile-size", p.TileSize)
@@ -469,7 +481,7 @@ func (yr *YANGRule) rule(opt YANGOptions) (r Rule, l2, mps int, err error) {
 	}
 	r.ID, r.IDLength = *yr.RuleIDValue, int(*yr.RuleIDLength)
 	if r.IDLength == 0 {
-		return r, 0, 0, errors.New("implicit rules (rule-id-length 0) are not supported")
+		r.Implicit = true // rule-id-length 0: the RuleID is implicit
 	}
 	if yr.RuleNature == "" {
 		return r, 0, 0, errors.New("rule-nature is mandatory")

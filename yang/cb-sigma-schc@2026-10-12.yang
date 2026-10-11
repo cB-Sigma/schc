@@ -16,11 +16,17 @@ module cb-sigma-schc {
   description
     "Identities that github.com/cB-Sigma/schc writes in RFC 9363 rule
      sets for what ietf-schc has no identity for: the IEC 62056-4-7
-     wrapper header fields, CoAP options registered after RFC 9363,
+     wrapper header fields, IPv4 and SCTP header fields, CoAP options
+     registered after RFC 9363,
      variable lengths counted in bits, and RCS algorithms besides CRC32.
 
      Copyright 2026 Abhinav Gautam. Licensed under the Apache License,
      Version 2.0.";
+
+  revision 2026-10-12 {
+    description
+      "Field IDs of IPv4 and SCTP.";
+  }
 
   revision 2026-10-11 {
     description
@@ -128,6 +134,145 @@ module cb-sigma-schc {
     description
       "Variable length whose residue size is counted in bits
        (RFC 8724 7.4.2), where fl-variable counts bytes.";
+  }
+
+  // Field IDs: IPv4, addresses named by role as RFC 8724 10.7 names the
+  // IPv6 ones.
+
+  identity fid-ipv4-base-type {
+    base schc:fid-base-type;
+    description
+      "Fields of the IPv4 header.";
+    reference
+      "RFC 791";
+  }
+
+  identity fid-ipv4-version {
+    base fid-ipv4-base-type;
+    description
+      "Version, 4 bits.";
+  }
+
+  identity fid-ipv4-ihl {
+    base fid-ipv4-base-type;
+    description
+      "Internet Header Length, 4 bits.";
+  }
+
+  identity fid-ipv4-tos {
+    base fid-ipv4-base-type;
+    description
+      "Type of Service byte, 8 bits.";
+  }
+
+  identity fid-ipv4-tos-ds {
+    base fid-ipv4-tos;
+    description
+      "The DSCP part of the Type of Service byte, 6 bits.";
+    reference
+      "RFC 2474";
+  }
+
+  identity fid-ipv4-tos-ecn {
+    base fid-ipv4-tos;
+    description
+      "The ECN part of the Type of Service byte, 2 bits.";
+    reference
+      "RFC 3168";
+  }
+
+  identity fid-ipv4-total-length {
+    base fid-ipv4-base-type;
+    description
+      "Total Length, 16 bits.";
+  }
+
+  identity fid-ipv4-identification {
+    base fid-ipv4-base-type;
+    description
+      "Identification, 16 bits.";
+  }
+
+  identity fid-ipv4-flags {
+    base fid-ipv4-base-type;
+    description
+      "Flags, 3 bits.";
+  }
+
+  identity fid-ipv4-fragment-offset {
+    base fid-ipv4-base-type;
+    description
+      "Fragment Offset, 13 bits.";
+  }
+
+  identity fid-ipv4-ttl {
+    base fid-ipv4-base-type;
+    description
+      "Time to Live, 8 bits.";
+  }
+
+  identity fid-ipv4-protocol {
+    base fid-ipv4-base-type;
+    description
+      "Protocol, 8 bits.";
+  }
+
+  identity fid-ipv4-checksum {
+    base fid-ipv4-base-type;
+    description
+      "Header Checksum, 16 bits.";
+  }
+
+  identity fid-ipv4-dev-address {
+    base fid-ipv4-base-type;
+    description
+      "The device's address, 32 bits: the source going up.";
+  }
+
+  identity fid-ipv4-app-address {
+    base fid-ipv4-base-type;
+    description
+      "The application's address, 32 bits.";
+  }
+
+  identity fid-ipv4-options {
+    base fid-ipv4-base-type;
+    description
+      "The options, when IHL is over 5: whole 32-bit words.";
+  }
+
+  // Field IDs: the SCTP common header.
+
+  identity fid-sctp-base-type {
+    base schc:fid-base-type;
+    description
+      "Fields of the SCTP common header.";
+    reference
+      "RFC 9260 3.1";
+  }
+
+  identity fid-sctp-dev-port {
+    base fid-sctp-base-type;
+    description
+      "The device's port, 16 bits.";
+  }
+
+  identity fid-sctp-app-port {
+    base fid-sctp-base-type;
+    description
+      "The application's port, 16 bits.";
+  }
+
+  identity fid-sctp-verification-tag {
+    base fid-sctp-base-type;
+    description
+      "Verification Tag, 32 bits.";
+  }
+
+  identity fid-sctp-checksum {
+    base fid-sctp-base-type;
+    description
+      "Checksum (CRC32c), 32 bits.";
   }
 
   // RCS algorithms.

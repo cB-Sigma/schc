@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"strings"
 )
 
@@ -55,7 +56,36 @@ const (
 	FICMPv6Checksum   = "icmpv6.checksum"
 	FICMPv6Identifier = "icmpv6.identifier"
 	FICMPv6Sequence   = "icmpv6.sequence"
+
+	// IPv4 (RFC 791), addresses by role as for IPv6; the ToS byte may be
+	// described as DSCP and ECN (RFC 2474, 3168); options, when IHL is
+	// over 5, are one field of whole 32-bit words.
+	FIPv4Version        = "ipv4.version"
+	FIPv4IHL            = "ipv4.ihl"
+	FIPv4ToS            = "ipv4.tos"
+	FIPv4DS             = "ipv4.ds"
+	FIPv4ECN            = "ipv4.ecn"
+	FIPv4TotalLength    = "ipv4.totalLength"
+	FIPv4Identification = "ipv4.identification"
+	FIPv4Flags          = "ipv4.flags"
+	FIPv4FragmentOffset = "ipv4.fragmentOffset"
+	FIPv4TTL            = "ipv4.ttl"
+	FIPv4Protocol       = "ipv4.protocol"
+	FIPv4Checksum       = "ipv4.checksum"
+	FIPv4DevAddress     = "ipv4.devAddress"
+	FIPv4AppAddress     = "ipv4.appAddress"
+	FIPv4Options        = "ipv4.options"
+
+	// SCTP common header (RFC 9260 3.1); the chunks are the payload.
+	FSCTPDevPort         = "sctp.devPort"
+	FSCTPAppPort         = "sctp.appPort"
+	FSCTPVerificationTag = "sctp.verificationTag"
+	FSCTPChecksum        = "sctp.checksum"
 )
+
+// variableFIDs are fields of variable length our parsers label besides the
+// CoAP ones.
+var variableFIDs = map[string]bool{FIPv4Options: true}
 
 // fieldLengths are the fixed lengths of the fields our parsers label.
 var fieldLengths = map[string]int{
@@ -64,10 +94,14 @@ var fieldLengths = map[string]int{
 	FUDPDevPort: 16, FUDPAppPort: 16, FUDPLength: 16, FUDPChecksum: 16,
 	FWrapperVersion: 16, FWrapperDevWPort: 16, FWrapperAppWPort: 16, FWrapperLength: 16,
 	FICMPv6Type: 8, FICMPv6Code: 8, FICMPv6Checksum: 16, FICMPv6Identifier: 16, FICMPv6Sequence: 16,
+	FIPv4Version: 4, FIPv4IHL: 4, FIPv4ToS: 8, FIPv4TotalLength: 16, FIPv4Identification: 16, FIPv4Flags: 3,
+	FIPv4FragmentOffset: 13, FIPv4TTL: 8, FIPv4Protocol: 8, FIPv4Checksum: 16, FIPv4DevAddress: 32, FIPv4AppAddress: 32,
+	FSCTPDevPort: 16, FSCTPAppPort: 16, FSCTPVerificationTag: 32, FSCTPChecksum: 32,
 }
 
 // computed are the fields a compute CDA can rebuild.
-var computed = map[string]bool{FIPv6PayloadLength: true, FUDPLength: true, FUDPChecksum: true, FWrapperLength: true, FICMPv6Checksum: true}
+var computed = map[string]bool{FIPv6PayloadLength: true, FUDPLength: true, FUDPChecksum: true, FWrapperLength: true, FICMPv6Checksum: true,
+	FIPv4IHL: true, FIPv4TotalLength: true, FIPv4Checksum: true, FSCTPChecksum: true}
 
 // Subfields a rule may describe in place of their field (RFC 9363 derives
 // their identities from the field's): the IPv6 Traffic Class as DSCP and
@@ -87,6 +121,7 @@ type subfield struct {
 
 var subfields = map[string][]subfield{
 	FIPv6TrafficClass: {{FIPv6DS, 0, 6}, {FIPv6ECN, 6, 8}},
+	FIPv4ToS:          {{FIPv4DS, 0, 6}, {FIPv4ECN, 6, 8}},
 	FCoAPCode:         {{FCoAPCodeClass, 0, 3}, {FCoAPCodeDetail, 3, 8}},
 }
 
@@ -121,12 +156,12 @@ func ParseStack(s string) (Stack, error) {
 		return nil, nil
 	}
 	parts := strings.FieldsFunc(s, func(r rune) bool { return r == '/' || r == ',' || r == '+' || r == ' ' })
-	order := map[string]int{"ipv6": 0, "udp": 1, "icmpv6": 1, "wrapper": 2, "coap": 2, "coap-inner": 2}
+	order := map[string]int{"ipv6": 0, "ipv4": 0, "udp": 1, "icmpv6": 1, "sctp": 1, "wrapper": 2, "coap": 2, "coap-inner": 2}
 	last := -1
 	for _, p := range parts {
 		o, ok := order[p]
 		if !ok {
-			return nil, fmt.Errorf("schc: layer %q is not ipv6, udp, icmpv6, coap, coap-inner or wrapper", p)
+			return nil, fmt.Errorf("schc: layer %q is not ipv6, ipv4, udp, sctp, icmpv6, coap, coap-inner or wrapper", p)
 		}
 		if o == 2 && last == 2 {
 			return nil, fmt.Errorf("schc: layers %q have more than one of coap, coap-inner and wrapper", s)
@@ -137,8 +172,11 @@ func ParseStack(s string) (Stack, error) {
 		last = o
 	}
 	st := Stack(parts)
-	if st.has("udp") && !st.has("ipv6") {
-		return nil, errors.New("schc: udp is compressed under ipv6 only")
+	if (st.has("udp") || st.has("sctp")) && !st.has("ipv6") && !st.has("ipv4") {
+		return nil, errors.New("schc: udp and sctp are compressed under ipv6 or ipv4")
+	}
+	if st.has("sctp") && len(st) != 2 {
+		return nil, errors.New("schc: sctp is compressed as ipv6/sctp or ipv4/sctp, its chunks as payload")
 	}
 	if st.has("coap-inner") && len(st) > 1 {
 		return nil, errors.New("schc: coap-inner (an OSCORE plaintext) is compressed alone")
@@ -211,10 +249,63 @@ func (st Stack) Parse(raw []byte, dir Direction) (Packet, error) {
 			add(FIPv6AppPrefix, app.Slice(0, 64))
 			add(FIPv6AppIID, app.Slice(64, 128))
 		}
-		if (st.has("udp") && b[6] != 17) || (st.has("icmpv6") && b[6] != 58) {
+		if (st.has("udp") && b[6] != 17) || (st.has("icmpv6") && b[6] != 58) || (st.has("sctp") && b[6] != 132) {
 			return Packet{}, errNotStack
 		}
 		b = b[40:]
+	}
+	if st.has("ipv4") {
+		if len(b) < 20 || b[0]>>4 != 4 {
+			return Packet{}, errNotStack
+		}
+		ihl := 4 * int(b[0]&0x0F)
+		total := int(binary.BigEndian.Uint16(b[2:4]))
+		if ihl < 20 || len(b) < ihl || total != len(b) {
+			return Packet{}, errNotStack
+		}
+		h := BytesOf(b[:20])
+		add(FIPv4Version, h.Slice(0, 4))
+		add(FIPv4IHL, h.Slice(4, 8))
+		add(FIPv4ToS, h.Slice(8, 16))
+		add(FIPv4TotalLength, h.Slice(16, 32))
+		add(FIPv4Identification, h.Slice(32, 48))
+		add(FIPv4Flags, h.Slice(48, 51))
+		add(FIPv4FragmentOffset, h.Slice(51, 64))
+		add(FIPv4TTL, h.Slice(64, 72))
+		add(FIPv4Protocol, h.Slice(72, 80))
+		add(FIPv4Checksum, h.Slice(80, 96))
+		if dir == Down {
+			add(FIPv4AppAddress, h.Slice(96, 128))
+			add(FIPv4DevAddress, h.Slice(128, 160))
+		} else {
+			add(FIPv4DevAddress, h.Slice(96, 128))
+			add(FIPv4AppAddress, h.Slice(128, 160))
+		}
+		if ihl > 20 {
+			add(FIPv4Options, BytesOf(append([]byte(nil), b[20:ihl]...)))
+		}
+		if (st.has("udp") && b[9] != 17) || (st.has("sctp") && b[9] != 132) {
+			return Packet{}, errNotStack
+		}
+		ipLen = total - ihl
+		b = b[ihl:]
+	}
+	if st.has("sctp") {
+		if len(b) < 12 {
+			return Packet{}, errNotStack
+		}
+		srcP, dstP := BytesOf(b[0:2]).Clone(), BytesOf(b[2:4]).Clone()
+		if dir == Down {
+			add(FSCTPAppPort, srcP)
+			add(FSCTPDevPort, dstP)
+		} else {
+			add(FSCTPDevPort, srcP)
+			add(FSCTPAppPort, dstP)
+		}
+		add(FSCTPVerificationTag, BytesOf(b[4:8]).Clone())
+		add(FSCTPChecksum, BytesOf(b[8:12]).Clone())
+		p.Payload = append([]byte(nil), b[12:]...)
+		return p, nil
 	}
 	if st.has("icmpv6") {
 		if len(b) < 4 {
@@ -349,6 +440,30 @@ func (st Stack) BuildFields(fields []Field, payload []byte, dir Direction) ([]by
 		}
 		body = append(h.Bytes(), body...)
 	}
+	if st.has("sctp") {
+		for _, fid := range []string{FSCTPDevPort, FSCTPAppPort, FSCTPVerificationTag} {
+			if _, err := get(fid); err != nil {
+				return nil, err
+			}
+		}
+		sctp := make([]byte, 12, 12+len(body))
+		sp, dp := vals[FSCTPDevPort].Bytes(), vals[FSCTPAppPort].Bytes()
+		if dir == Down {
+			sp, dp = dp, sp
+		}
+		copy(sctp[0:2], sp)
+		copy(sctp[2:4], dp)
+		copy(sctp[4:8], vals[FSCTPVerificationTag].Bytes())
+		sctp = append(sctp, body...)
+		if v, ok := vals[FSCTPChecksum]; ok {
+			copy(sctp[8:12], v.Bytes())
+		} else {
+			// CRC32c over the packet with the checksum field zero, sent
+			// least significant byte first (RFC 9260 6.8, appendix A).
+			binary.LittleEndian.PutUint32(sctp[8:12], crc32.Checksum(sctp, castagnoli))
+		}
+		body = sctp
+	}
 	var udp []byte
 	if st.has("udp") {
 		for _, fid := range []string{FUDPDevPort, FUDPAppPort} {
@@ -442,10 +557,124 @@ func (st Stack) BuildFields(fields []Field, payload []byte, dir Direction) ([]by
 			}
 		}
 		body = append(ip, body...)
+	} else if st.has("ipv4") {
+		ip, err := buildIPv4(vals, body, dir)
+		if err != nil {
+			return nil, err
+		}
+		if udp != nil {
+			if v, ok := vals[FUDPChecksum]; ok {
+				copy(udp[6:8], v.Bytes())
+			} else {
+				binary.BigEndian.PutUint16(udp[6:8], udp4Checksum(ip[12:16], ip[16:20], udp))
+			}
+		}
+		body = append(ip, body...)
 	} else if udp != nil || icmp != nil {
 		return nil, errors.New("schc: udp and icmpv6 need ipv6")
 	}
 	return body, nil
+}
+
+// buildIPv4 writes an IPv4 header (RFC 791) for a payload: IHL, Total
+// Length and Header Checksum are computed unless given.
+func buildIPv4(vals map[string]Bits, payload []byte, dir Direction) ([]byte, error) {
+	opts := vals[FIPv4Options]
+	if opts.Len()%32 != 0 || opts.Len() > 40*8 {
+		return nil, fmt.Errorf("schc: IPv4 options of %d bits are not whole 32-bit words up to 40 bytes", opts.Len())
+	}
+	ihl := 20 + opts.Len()/8
+	get := func(fid string) (Bits, error) {
+		v, ok := vals[fid]
+		if !ok {
+			return Bits{}, fmt.Errorf("schc: field %s has no value", fid)
+		}
+		if v.Len() != fieldLengths[fid] {
+			return Bits{}, fmt.Errorf("schc: field %s has %d bits, not %d", fid, v.Len(), fieldLengths[fid])
+		}
+		return v, nil
+	}
+	var h Bits
+	v, err := get(FIPv4Version)
+	if err != nil {
+		return nil, err
+	}
+	h.Append(v)
+	if v, ok := vals[FIPv4IHL]; ok {
+		h.Append(v)
+	} else {
+		h.AppendUint(uint64(ihl/4), 4)
+	}
+	if v, err = get(FIPv4ToS); err != nil {
+		return nil, err
+	}
+	h.Append(v)
+	if v, ok := vals[FIPv4TotalLength]; ok {
+		h.Append(v)
+	} else {
+		if ihl+len(payload) > 0xFFFF {
+			return nil, errors.New("schc: the IPv4 packet is over 65535 bytes")
+		}
+		h.AppendUint(uint64(ihl+len(payload)), 16)
+	}
+	for _, fid := range []string{FIPv4Identification, FIPv4Flags, FIPv4FragmentOffset, FIPv4TTL, FIPv4Protocol} {
+		if v, err = get(fid); err != nil {
+			return nil, err
+		}
+		h.Append(v)
+	}
+	sum, hasSum := vals[FIPv4Checksum]
+	h.AppendUint(0, 16)
+	order := []string{FIPv4DevAddress, FIPv4AppAddress}
+	if dir == Down {
+		order = []string{FIPv4AppAddress, FIPv4DevAddress}
+	}
+	for _, fid := range order {
+		if v, err = get(fid); err != nil {
+			return nil, err
+		}
+		h.Append(v)
+	}
+	h.Append(opts)
+	ip := h.Bytes()
+	if hasSum {
+		copy(ip[10:12], sum.Bytes())
+	} else {
+		binary.BigEndian.PutUint16(ip[10:12], onesSum(ip))
+	}
+	return ip, nil
+}
+
+// onesSum is the Internet checksum (RFC 1071) of b.
+func onesSum(b []byte) uint16 {
+	var sum uint32
+	for i := 0; i+1 < len(b); i += 2 {
+		sum += uint32(b[i])<<8 | uint32(b[i+1])
+	}
+	if len(b)%2 == 1 {
+		sum += uint32(b[len(b)-1]) << 8
+	}
+	for sum>>16 != 0 {
+		sum = sum&0xFFFF + sum>>16
+	}
+	return ^uint16(sum)
+}
+
+// udp4Checksum is the UDP checksum over the IPv4 pseudo-header (RFC 768)
+// with the checksum field zero; zero is sent as FFFFh.
+func udp4Checksum(src, dst, udp []byte) uint16 {
+	ph := make([]byte, 0, 12+len(udp))
+	ph = append(ph, src...)
+	ph = append(ph, dst...)
+	ph = append(ph, 0, 17, byte(len(udp)>>8), byte(len(udp)))
+	ph = append(ph, udp[:6]...)
+	ph = append(ph, 0, 0)
+	ph = append(ph, udp[8:]...)
+	c := onesSum(ph)
+	if c == 0 {
+		c = 0xFFFF
+	}
+	return c
 }
 
 // isEcho reports whether an ICMPv6 type is Echo Request or Echo Reply

@@ -41,7 +41,15 @@ type Receiver struct {
 	all1T  *Bits // the last tile carried in the All-1
 	rcsGot uint32
 	top    int // highest tile number seen, -1 none
+	// alts are, with a rule's PenultimateShort, the other readings of a
+	// fragment's end: a penultimate tile one L2 Word short, then the last
+	// tile or only padding (the last tile in the All-1), keyed by the
+	// penultimate's tile number. check tries them when the plain reading
+	// fails the RCS.
+	alts map[int][]altSplit
 }
+
+type altSplit struct{ pen, last Bits }
 
 // Receiver phases (ACK-Always).
 const (
@@ -186,12 +194,26 @@ func (rv *Receiver) noAck(m *FragMsg) ([]Bits, error) {
 	for _, t := range rv.seq {
 		pkt.Append(t)
 	}
-	if rv.p.rcs(pkt) != m.RCS {
+	ok := rv.p.rcs(pkt) == m.RCS
+	if rv.p.countRCS() {
+		// The count of fragments, the All-1 included (RFC 9442).
+		ok = uint32(len(rv.seq))&(1<<uint(rv.p.RCSSize)-1) == m.RCS
+	}
+	if !ok {
 		rv.err = errors.New("schc: the integrity check failed")
 		return nil, rv.err
 	}
 	rv.packet, rv.done = pkt, true
 	return nil, nil
+}
+
+// countOf is the fragment count an All-1 carried (RCSFragmentCount), 0
+// read as 2^rcsSize.
+func (rv *Receiver) countOf(rcs uint32) int {
+	if rcs == 0 {
+		return 1 << uint(rv.p.RCSSize)
+	}
+	return int(rcs)
 }
 
 // --- ACK-Always (RFC 8724 8.4.2.2) ---
@@ -248,6 +270,20 @@ func (rv *Receiver) aaNext() {
 // aaCheck runs the integrity check over windows 0..wc.
 func (rv *Receiver) aaCheck(rcsGot uint32) bool {
 	ws := rv.p.WindowSize
+	if rv.p.countRCS() {
+		// The last window has count-1 regular fragments from its first
+		// place, then the All-1 in the last place.
+		n := rv.countOf(rcsGot)
+		tw := rv.win[rv.wc]
+		if _, ok := tw[ws-1]; !ok || n > ws {
+			return false
+		}
+		for pos := 0; pos < ws-1; pos++ {
+			if _, ok := tw[pos]; ok != (pos < n-1) {
+				return false
+			}
+		}
+	}
 	var pkt Bits
 	for w := uint32(0); w <= rv.wc; w++ {
 		tw := rv.win[w]
@@ -262,7 +298,7 @@ func (rv *Receiver) aaCheck(rcsGot uint32) bool {
 			pkt.Append(t)
 		}
 	}
-	if rv.p.rcs(pkt) != rcsGot {
+	if !rv.p.countRCS() && rv.p.rcs(pkt) != rcsGot {
 		return false
 	}
 	rv.packet = pkt
@@ -421,6 +457,22 @@ func (rv *Receiver) aoe(m *FragMsg) []Bits {
 			// padding), or a penultimate one L2 Word short.
 			put(t+k, pl.Slice(k*ts, pl.Len()))
 		}
+		if rv.p.PenultimateShort && k >= 0 {
+			// The same payload read as ending in a penultimate tile one
+			// L2 Word short, followed by the last tile with its padding or
+			// by padding alone (RFC 8724 8.4.3.1): the RCS decides between
+			// the readings.
+			pen := ts - rv.word
+			if rv.alts == nil {
+				rv.alts = map[int][]altSplit{}
+			}
+			if at := (k-1)*ts + pen; k >= 1 && pl.Len()-at >= rv.word && t+k < limit {
+				rv.alts[t+k-1] = append(rv.alts[t+k-1], altSplit{pen: pl.Slice((k-1)*ts, at), last: pl.Slice(at, pl.Len())})
+			}
+			if left := pl.Len() - k*ts; left >= pen && left < pen+rv.word && t+k < limit {
+				rv.alts[t+k] = append(rv.alts[t+k], altSplit{pen: pl.Slice(k*ts, k*ts+pen)})
+			}
+		}
 		if rv.size() > rv.max {
 			return rv.abort(errors.New("schc: the reassembled packet is over maxPacketSize"))
 		}
@@ -472,6 +524,27 @@ func (rv *Receiver) check() bool {
 	if !rv.all1 {
 		return false
 	}
+	if rv.p.countRCS() {
+		// RFC 9442: the All-1 says how many fragments its window has, so
+		// the packet is the tiles before it, then the All-1's payload.
+		r := rv.countRegular()
+		if r < 0 || rv.top >= r {
+			return false
+		}
+		var pkt Bits
+		for n := 0; n < r; n++ {
+			t, ok := rv.tiles[n]
+			if !ok {
+				return false
+			}
+			pkt.Append(t)
+		}
+		if rv.all1T != nil {
+			pkt.Append(*rv.all1T)
+		}
+		rv.packet, rv.done = pkt, true
+		return true
+	}
 	var pkt Bits
 	for n := 0; n <= rv.top; n++ {
 		t, ok := rv.tiles[n]
@@ -480,6 +553,42 @@ func (rv *Receiver) check() bool {
 		}
 		pkt.Append(t)
 	}
+	if rv.checkPacket(pkt) {
+		return true
+	}
+	// With a penultimate tile one L2 Word short, the fragment that ends
+	// the packet reads differently: its last full-size tile is the short
+	// penultimate one and what followed it the last tile. The plain
+	// reading put the last tile at top (it was at least an L2 Word) or
+	// took it for padding.
+	for _, pen := range []int{rv.top - 1, rv.top} {
+		if pen < 0 {
+			continue
+		}
+		for _, a := range rv.alts[pen] {
+			var alt Bits
+			for n := 0; n < pen; n++ {
+				alt.Append(rv.tiles[n])
+			}
+			alt.Append(a.pen)
+			alt.Append(a.last)
+			if rv.checkPacket(alt) {
+				rv.tiles[pen] = a.pen
+				rv.top = pen
+				if a.last.Len() > 0 {
+					rv.tiles[pen+1] = a.last
+					rv.top = pen + 1
+				}
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// checkPacket checks the reassembled tiles against the RCS, with the All-1's
+// payload as the last tile or as padding.
+func (rv *Receiver) checkPacket(pkt Bits) bool {
 	if rv.all1T != nil {
 		with := pkt.Clone()
 		with.Append(*rv.all1T)
@@ -498,11 +607,23 @@ func (rv *Receiver) check() bool {
 	return true
 }
 
+// countRegular is, with RCSFragmentCount, the number of tiles sent in
+// regular fragments that the All-1's count gives; -1 when it cannot be.
+func (rv *Receiver) countRegular() int {
+	n := rv.countOf(rv.rcsGot)
+	if n > rv.p.WindowSize {
+		return -1
+	}
+	return int(rv.all1W)*rv.p.WindowSize + n - 1
+}
+
 // missingIn reports whether window w has tiles it knows are missing.
 func (rv *Receiver) missingIn(w uint32) bool {
 	ws := rv.p.WindowSize
 	lo, hi := int(w)*ws, int(w)*ws+ws-1
-	if rv.all1 && w == rv.all1W {
+	if rv.all1 && w == rv.all1W && rv.p.countRCS() {
+		hi = rv.countRegular() - 1
+	} else if rv.all1 && w == rv.all1W {
 		// The last window: gaps below the highest tile seen in it, and
 		// the rest when no tile of it came yet.
 		hi = -1
@@ -554,6 +675,14 @@ func (rv *Receiver) respond() []Bits {
 	if len(missing) > 0 {
 		// One SCHC Compound ACK for every window with tiles missing,
 		// lowest first (RFC 9441 3.2.1.2).
+		if max := rv.p.AckMaxBits; max > 0 {
+			// Only the windows that fit the ACK's frame, lowest first; the
+			// others come in a later ACK.
+			for len(missing) > 1 && rv.enc(&FragMsg{Kind: MsgAck, W: missing[0], Bitmap: make([]bool, rv.p.WindowSize),
+				More: windowBitmaps(missing[1:], rv.p.WindowSize)}).Len() > max {
+				missing = missing[:len(missing)-1]
+			}
+		}
 		return rv.aoeAck(missing[0], false, missing[1:]...)
 	}
 	return rv.aoeAck(last, false)
@@ -590,4 +719,13 @@ func (rv *Receiver) aoeBitmap(w uint32) []bool {
 		bm[ws-1] = true // the All-1 was received (RFC 8724 figure 32)
 	}
 	return bm
+}
+
+// windowBitmaps are empty bitmaps of windows ws, to size a Compound ACK.
+func windowBitmaps(ws []uint32, size int) []WindowBitmap {
+	out := make([]WindowBitmap, len(ws))
+	for i, w := range ws {
+		out[i] = WindowBitmap{W: w, Bitmap: make([]bool, size)}
+	}
+	return out
 }

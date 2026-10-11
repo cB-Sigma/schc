@@ -45,8 +45,21 @@ var (
 		// CRC-8 with polynomial 07h (ITU-T I.432.1 HEC without its XOR,
 		// as SMBus uses it), initial value 0.
 		"crc8": {Name: "crc8", Bits: 8, Sum: crc8},
+		// The fragment count of RFC 9442 3.5.1.5 (see RCSFragmentCount):
+		// not a sum, its size comes from the rule.
+		RCSFragmentCount: {Name: RCSFragmentCount, Sum: func([]byte) uint32 { return 0 }},
 	}
 )
+
+// RCSFragmentCount is the RCS of the Sigfox profile (RFC 9442 3.5.1.5): the
+// field carries the number of fragments of the All-1's window, the All-1
+// included (for No-ACK, of the whole packet), modulo 2^rcsSize, so the
+// receiver knows how many tiles the last window has. It checks no content.
+// The RFC does not say how the count is formed; this follows the
+// implementation of the RFC's authors (github.com/schc-over-sigfox, MIT,
+// Fragmenter.generate_fragment), see PROVENANCE.md. A rule naming it gives
+// its size in rcsSize.
+const RCSFragmentCount = "fragment-count"
 
 // RegisterRCS adds an RCS algorithm a profile defines, for rules to name.
 // A name already registered is an error.

@@ -85,6 +85,9 @@ func (m *FragMsg) Encode(word int) Bits {
 	case MsgFragment:
 		h := header(r, m.DTag, m.W)
 		h.AppendUint(uint64(m.FCN), p.FCNSize)
+		if p.HeaderPadded {
+			h.Pad(word)
+		}
 		h.Append(m.Payload)
 		h.Pad(word)
 		return h
@@ -92,6 +95,9 @@ func (m *FragMsg) Encode(word int) Bits {
 		h := header(r, m.DTag, m.W)
 		h.AppendUint(uint64(p.all1()), p.FCNSize)
 		h.AppendUint(uint64(m.RCS), p.RCSSize)
+		if p.HeaderPadded {
+			h.Pad(word)
+		}
 		h.Append(m.Payload)
 		h.Pad(word)
 		return h
@@ -115,6 +121,11 @@ func (m *FragMsg) Encode(word int) Bits {
 		h.AppendBit(0)
 		if p.CompoundAck {
 			encodeCompound(&h, m, p, word)
+			return h
+		}
+		if p.BitmapUncompressed {
+			appendBitmap(&h, m.Bitmap, word, false)
+			h.Pad(word)
 			return h
 		}
 		compressBitmap(&h, m.Bitmap, word)
@@ -178,7 +189,7 @@ func encodeCompound(h *Bits, m *FragMsg, p *FragParams, word int) {
 			h.AppendUint(uint64(wb.W), p.WSize)
 		}
 		last := i == len(all)-1
-		cut = appendBitmap(h, wb.Bitmap, word, last && !p.LastBitmapUncompressed)
+		cut = appendBitmap(h, wb.Bitmap, word, last && !p.LastBitmapUncompressed && !p.BitmapUncompressed)
 	}
 	if cut {
 		return
@@ -224,11 +235,21 @@ func DecodeAtReceiver(r *Rule, msg Bits, word int) (*FragMsg, error) {
 			return nil, err
 		}
 		m.RCS = uint32(v)
+		if p.HeaderPadded {
+			if _, err = rd.bits(min(padOf(rd.pos, word), rd.rem())); err != nil {
+				return nil, err
+			}
+		}
 		m.Payload = rd.rest()
 	case m.FCN == 0 && p.Mode != NoAck && rd.rem() < word:
 		m.Kind = MsgAckReq
 	default:
 		m.Kind = MsgFragment
+		if p.HeaderPadded {
+			if _, err = rd.bits(min(padOf(rd.pos, word), rd.rem())); err != nil {
+				return nil, err
+			}
+		}
 		m.Payload = rd.rest()
 		if m.Payload.Len() < word {
 			return nil, fmt.Errorf("schc: a fragment without a tile")
