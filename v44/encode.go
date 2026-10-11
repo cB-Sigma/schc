@@ -8,13 +8,15 @@ import "bytes"
 // bitWriter packs codes least significant bit first, starting at bit 1 of
 // each octet (6.6, Table 6).
 type bitWriter struct {
-	out  []byte
-	acc  uint64
-	nacc uint
+	out   []byte
+	acc   uint64
+	nacc  uint
+	count int // bits written
 }
 
 // bits writes the n low bits of v, least significant first.
 func (w *bitWriter) bits(v uint32, n uint) {
+	w.count += int(n)
 	w.acc |= uint64(v&(1<<n-1)) << w.nacc
 	w.nacc += n
 	for w.nacc >= 8 {
@@ -31,6 +33,7 @@ func (w *bitWriter) bit(b uint32) { w.bits(b, 1) }
 func (w *bitWriter) align() {
 	if w.nacc > 0 {
 		w.out = append(w.out, byte(w.acc))
+		w.count += int(8 - w.nacc)
 		w.acc, w.nacc = 0, 0
 	}
 }
@@ -47,7 +50,7 @@ type node struct {
 type encoder struct {
 	p     Params
 	w     bitWriter
-	src   []byte // the history: the packet's characters
+	src   []byte // the history: the characters since the last reinitialization, and those not encoded yet
 	root  [256]int
 	nodes []node // indexed by codeword; entries below firstCW unused
 	c1    int    // next codeword
@@ -57,6 +60,15 @@ type encoder struct {
 	// afterCodeword is whether the last code transferred was a codeword,
 	// which selects the code prefixes of Table 5.
 	afterCodeword bool
+
+	// The multi-packet and stream methods (persistent dictionary).
+	persist bool // reinitialize when the node-tree is full (7.11.3) rather than stop creating (B.1.1)
+	full    bool // a codeword could not be created: REINIT before the next code
+	pos     int  // the next character of src to encode
+	pending int  // after a FLUSH: 0 none, 1 append the next character to root pendC, 2 to node pendN
+	pendC   byte //
+	pendN   int  //
+	reinits int  // REINIT control codes sent (tests and statistics)
 }
 
 // reset puts the dictionary in its initial state (7.5.1).
@@ -67,6 +79,17 @@ func (e *encoder) reset() {
 	e.nodes = e.nodes[:firstCW]
 	e.c1, e.c2, e.c3, e.c5 = firstCW, initC2, initC3, initC5
 	e.afterCodeword = false
+	e.full, e.pending = false, 0
+}
+
+// reinit transfers REINIT and starts a new dictionary and history at the
+// next character to encode (7.12, 7.11.3, 7.11.4).
+func (e *encoder) reinit() {
+	e.control(ctlREINIT)
+	e.reset()
+	e.src = append(e.src[:0:0], e.src[e.pos:]...)
+	e.pos = 0
+	e.reinits++
 }
 
 // Compress compresses one packet with the packet method: reset, encode,
@@ -108,29 +131,51 @@ func newEncoder(p Params, src []byte) *encoder {
 // is set (each ended as if the history were full, then REINIT: 7.11.4,
 // 7.12, B.2.1), and ends it with FLUSH (7.13).
 func (e *encoder) run() {
-	start := 0
-	for start < len(e.src) {
+	for e.pos < len(e.src) {
 		end := len(e.src)
-		if e.p.History > 0 && end-start > e.p.History {
-			end = start + e.p.History
+		if e.p.History > 0 && end > e.p.History {
+			end = e.p.History
 		}
-		e.encodeRun(start, end)
-		start = end
-		if start < len(e.src) {
-			e.control(ctlREINIT)
-			e.reset()
+		e.encodeTo(end, end)
+		if e.pos < len(e.src) {
+			e.reinit()
 		}
 	}
 	e.control(ctlFLUSH)
 	e.w.align()
 }
 
-// encodeRun encodes src[start:end] against a dictionary that covers only
-// that run (6.3).
-func (e *encoder) encodeRun(start, end int) {
+// applyPending creates the string-segment a FLUSH left waiting for its
+// next character (7.13: the dictionary is updated by appending the
+// character that follows the flush), now that it is at e.pos.
+func (e *encoder) applyPending() {
+	switch e.pending {
+	case 1:
+		e.appendRoot(e.pendC, e.pos)
+	case 2:
+		e.child(e.pendN, e.pos, 1)
+	}
+	e.pending = 0
+	if e.full {
+		e.reinit()
+	}
+}
+
+// encodeTo encodes the characters of src from e.pos up to limit, matching
+// and extending strings within src[:end] (6.3). At end, a character that
+// would be appended (Table 1) is left pending for the next call. In the
+// persistent methods a full node-tree reinitializes the dictionary
+// (7.11.3).
+func (e *encoder) encodeTo(limit, end int) {
+	if e.pending != 0 && e.pos < end {
+		p0 := e.pos
+		e.applyPending()
+		limit, end = limit-(p0-e.pos), end-(p0-e.pos)
+	}
 	src := e.src
 	n7 := e.p.MaxString
-	for i := start; i < end; {
+	for e.pos < limit {
+		i := e.pos
 		c := src[i]
 		// String matching (6.3.1): climb down from the root, taking at each
 		// level the longest string-segment that the next characters match
@@ -150,45 +195,69 @@ func (e *encoder) encodeRun(start, end int) {
 			cur, j = best, j+bestLen
 			child = e.nodes[best].down
 		}
-		if cur < 0 {
-			// Matching failed: the ordinal, and the next character appended
-			// to the root (Table 1, first row).
-			e.ordinal(c)
-			if i+1 < end {
-				e.appendRoot(c, i+1)
-			}
-			i++
-			continue
+		e.step(i, j, cur, c, end, n7)
+		if e.full {
+			// The node-tree is full (7.11.3): REINIT, and the characters
+			// not encoded yet move to the start of a new history.
+			p0 := e.pos
+			e.reinit()
+			limit, end, src = limit-p0, end-p0, e.src
 		}
-		e.codeword(cur)
-		// String extension (6.3.2) against the history after the last
-		// matched string-segment, while the string stays within N7.
-		total := j - i
-		from := e.nodes[cur].pos + e.nodes[cur].length
-		k := 0
-		for j+k < end && total+k < n7 && src[from+k] == src[j+k] {
-			k++
-		}
-		if k > 0 {
-			e.extensionLength(k)
-			e.child(cur, j, k)
-			i = j + k
-			continue
-		}
-		// Extension failed: the unmatched character is appended to the
-		// last matched string-segment, unless the string is already N7
-		// long (Table 2 note).
-		if j < end && total < n7 {
-			e.child(cur, j, 1)
-		}
-		i = j
 	}
 }
 
+// step transfers the codes for the string match at i (cur and j from the
+// matching; cur < 0 when it failed) and creates the string-segment of
+// Table 1.
+func (e *encoder) step(i, j, cur int, c byte, end, n7 int) {
+	src := e.src
+	if cur < 0 {
+		// Matching failed: the ordinal, and the next character appended
+		// to the root (Table 1, first row).
+		e.ordinal(c)
+		if i+1 < end {
+			e.appendRoot(c, i+1)
+		} else {
+			e.pending, e.pendC = 1, c
+		}
+		e.pos = i + 1
+		return
+	}
+	e.codeword(cur)
+	// String extension (6.3.2) against the history after the last
+	// matched string-segment, while the string stays within N7.
+	total := j - i
+	from := e.nodes[cur].pos + e.nodes[cur].length
+	k := 0
+	for j+k < end && total+k < n7 && src[from+k] == src[j+k] {
+		k++
+	}
+	if k > 0 {
+		e.extensionLength(k)
+		e.child(cur, j, k)
+		e.pos = j + k
+		return
+	}
+	// Extension failed: the unmatched character is appended to the last
+	// matched string-segment, unless the string is already N7 long (Table
+	// 2 note).
+	if total < n7 {
+		if j < end {
+			e.child(cur, j, 1)
+		} else {
+			e.pending, e.pendN = 2, cur
+		}
+	}
+	e.pos = j
+}
+
 // newNode creates the next codeword's node, unless the node-tree is full:
-// then the packet method creates no more (B.1.1). It returns -1 then.
+// then the packet method creates no more (B.1.1), and the persistent
+// methods reinitialize after the current code (7.11.3). It returns -1
+// then.
 func (e *encoder) newNode(pos, length int) int {
 	if e.c1 >= e.p.Codewords {
+		e.full = e.persist
 		return -1
 	}
 	e.nodes = append(e.nodes, node{pos: pos, length: length, down: -1, side: -1})

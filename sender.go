@@ -69,28 +69,62 @@ func NewSender(r *Rule, word int, dtag uint32, packet Bits) (*Sender, error) {
 		return nil, errors.New("schc: nothing to fragment")
 	}
 	s := &Sender{r: r, p: p, word: word, dtag: dtag, packet: packet, waitWin: -1}
-	if p.Mode == AckOnError {
-		ts := p.TileSize
-		for i := 0; i < packet.Len(); i += ts {
-			s.tiles = append(s.tiles, packet.Slice(i, min(i+ts, packet.Len())))
+	if p.Mode == AckOnError && p.TileSize > 0 {
+		if err := s.cutTiles(p.TileSize); err != nil {
+			return nil, err
 		}
+	}
+	return s, nil
+}
+
+// cutTiles cuts the packet into tiles of ts bits (ACK-on-Error) and
+// decides where the last one goes.
+func (s *Sender) cutTiles(ts int) error {
+	p, packet, word := s.p, s.packet, s.word
+	for i := 0; i < packet.Len(); i += ts {
+		s.tiles = append(s.tiles, packet.Slice(i, min(i+ts, packet.Len())))
+	}
+	if len(s.tiles) > (1<<uint(p.WSize))*p.WindowSize {
+		return fmt.Errorf("schc: %d tiles do not fit in %d windows of %d (RFC 8724 8.4.3.1)", len(s.tiles), 1<<uint(p.WSize), p.WindowSize)
+	}
+	lt := s.tiles[len(s.tiles)-1]
+	lastIdx := p.WindowSize - 1 - (len(s.tiles)-1)%p.WindowSize
+	h := s.headerBits(false)
+	// The last tile goes in the All-1 when the profile says so, when it
+	// is shorter than an L2 Word (a regular fragment's receiver would drop
+	// it as padding), when its padding in a regular fragment could not be
+	// told apart from a tile, or when it would share the rightmost bitmap
+	// bit with the All-1 (tile index 0). With tiles that fill their
+	// fragment the receiver takes a fragment's payload as one tile, so
+	// padding is no question.
+	fill := p.TileSize == 0
+	s.lastInAll = p.LastTile == LastTileAll1 || lt.Len() < word || lastIdx == 0 ||
+		(!fill && (ts%word != 0 || h%word != 0))
+	if p.LastTile == LastTileRegular && s.lastInAll && lt.Len() >= word && lastIdx != 0 {
+		s.lastInAll = false
+	}
+	if fill && s.lastInAll && s.headerBits(true)+lt.Len() > (h+ts) {
+		// The last tile must go in the All-1 but does not fit beside the
+		// RCS: cut it in two, the first ending its fragment on an L2
+		// Word, the second small enough for the All-1.
+		n := len(s.tiles) - 1
+		a := (h+lt.Len()-1)/word*word - h
+		b := lt.Len() - a
+		if a < word || s.headerBits(true)+b > h+ts {
+			return fmt.Errorf("schc: the MTU leaves no room for the last tile in the All-1")
+		}
+		s.tiles = append(s.tiles[:n], lt.Slice(0, a), lt.Slice(a, lt.Len()))
 		if len(s.tiles) > (1<<uint(p.WSize))*p.WindowSize {
-			return nil, fmt.Errorf("schc: %d tiles do not fit in %d windows of %d (RFC 8724 8.4.3.1)", len(s.tiles), 1<<uint(p.WSize), p.WindowSize)
+			return fmt.Errorf("schc: %d tiles do not fit in %d windows of %d (RFC 8724 8.4.3.1)", len(s.tiles), 1<<uint(p.WSize), p.WindowSize)
 		}
-		lt := s.tiles[len(s.tiles)-1]
-		lastIdx := p.WindowSize - 1 - (len(s.tiles)-1)%p.WindowSize
-		h := r.IDLength + p.DTagSize + p.WSize + p.FCNSize
-		// The last tile goes in the All-1 when the profile says so, when
-		// it is shorter than an L2 Word (a regular fragment's receiver
-		// would drop it as padding), when its padding in a regular
-		// fragment could not be told apart from a tile, or when it would
-		// share the rightmost bitmap bit with the All-1 (tile index 0).
-		s.lastInAll = p.LastTile == LastTileAll1 || lt.Len() < word || p.TileSize%word != 0 || h%word != 0 || lastIdx == 0
+		lt = s.tiles[n+1]
+		lastIdx = p.WindowSize - 1 - (n+1)%p.WindowSize
+		s.lastInAll = p.LastTile == LastTileAll1 || lt.Len() < word || lastIdx == 0
 		if p.LastTile == LastTileRegular && s.lastInAll && lt.Len() >= word && lastIdx != 0 {
 			s.lastInAll = false
 		}
 	}
-	return s, nil
+	return nil
 }
 
 // Done reports whether the transfer ended; Err is its error (nil when the
@@ -125,7 +159,7 @@ func padOf(n, word int) int { return (word - n%word) % word }
 func (s *Sender) rcsWith(pad int) uint32 {
 	x := s.packet.Clone()
 	x.AppendUint(0, pad)
-	return rcs(x)
+	return s.p.rcs(x)
 }
 
 // Start sends the first messages: every fragment in No-ACK, the first
@@ -137,6 +171,17 @@ func (s *Sender) Start(now time.Time, mtu int) ([]Bits, error) {
 	case AckAlways:
 		return s.blindWindow(now, mtu)
 	default:
+		if s.tiles == nil {
+			// Tiles that fill the fragment (RFC 9363 tile-size absent):
+			// the whole L2 Words this MTU leaves after the header.
+			ts := mtu/s.word*s.word - s.headerBits(false)
+			if ts < s.word {
+				return s.fail(fmt.Errorf("schc: an MTU of %d bits leaves no room for a tile", mtu)), s.err
+			}
+			if err := s.cutTiles(ts); err != nil {
+				return s.fail(err), err
+			}
+		}
 		return s.aoeBlind(now, mtu)
 	}
 }
@@ -245,6 +290,9 @@ func (s *Sender) Receive(now time.Time, msg Bits, mtu int) ([]Bits, error) {
 	case AckAlways:
 		return s.ackAlways(now, m, mtu)
 	case AckOnError:
+		if s.tiles == nil {
+			return nil, nil // not started: nothing was sent to acknowledge
+		}
 		return s.aoeAck(now, m, mtu)
 	}
 	return nil, nil
@@ -366,6 +414,9 @@ func (s *Sender) packTiles(from, to, mtu int, stopAtWindow bool) ([]Bits, error)
 		var pl Bits
 		j := i
 		for j < to && h+pl.Len()+s.tiles[j].Len() <= mtu {
+			if j > i && s.p.TileSize == 0 {
+				break // a tile fills its fragment: one per fragment
+			}
 			if j > i && stopAtWindow {
 				if wj, _ := s.tileWin(j); wj != w {
 					break
@@ -429,8 +480,11 @@ func (s *Sender) aoeBlind(now time.Time, mtu int) ([]Bits, error) {
 // aoeAck handles an ACK-on-Error SCHC ACK for window m.W.
 func (s *Sender) aoeAck(now time.Time, m *FragMsg, mtu int) ([]Bits, error) {
 	lw := s.lastWin()
-	if m.W > lw {
-		return nil, nil
+	reports := append([]WindowBitmap{{W: m.W, Bitmap: m.Bitmap}}, m.More...)
+	for _, r := range reports {
+		if r.W > lw {
+			return nil, nil // a window never sent: the whole ACK is discarded (RFC 9441 3.1)
+		}
 	}
 	if m.C {
 		if m.W == lw && s.all1Sent {
@@ -439,17 +493,22 @@ func (s *Sender) aoeAck(now time.Time, m *FragMsg, mtu int) ([]Bits, error) {
 		return nil, nil
 	}
 	ws := s.p.WindowSize
-	// Tiles of window m.W that were sent and are reported missing.
-	first := int(m.W) * ws
+	// Tiles of the reported windows that were sent and are missing; a
+	// Compound ACK reports several windows (RFC 9441 3.2.1.1).
 	var missing []int
-	for i := first; i < min(first+ws, s.sentUpTo); i++ {
-		_, idx := s.tileWin(i)
-		if !m.Bitmap[ws-1-int(idx)] {
-			missing = append(missing, i)
+	isLast, all1Missing := false, false
+	for _, r := range reports {
+		first := int(r.W) * ws
+		for i := first; i < min(first+ws, s.sentUpTo); i++ {
+			_, idx := s.tileWin(i)
+			if !r.Bitmap[ws-1-int(idx)] {
+				missing = append(missing, i)
+			}
+		}
+		if r.W == lw && s.all1Sent {
+			isLast, all1Missing = true, !r.Bitmap[ws-1]
 		}
 	}
-	isLast := m.W == lw && s.all1Sent
-	all1Missing := isLast && !m.Bitmap[ws-1]
 	if isLast && len(missing) == 0 && !all1Missing && s.lastInAll {
 		return s.fail(errors.New("schc: every tile arrived but the integrity check failed")), s.err
 	}

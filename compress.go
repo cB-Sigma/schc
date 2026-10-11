@@ -75,6 +75,27 @@ func (r *Rule) pair(p Packet, dir Direction) ([]*FieldDescriptor, []Field, bool)
 		if !fd.applies(dir) {
 			continue
 		}
+		if fd.group > 1 {
+			// One entry for instances fp to fp+group-1 (RFC 8824 5.3).
+			var vs []Bits
+			for pos := fd.fp; pos < fd.fp+fd.group; pos++ {
+				found := -1
+				for j, f := range p.Fields {
+					if !used[j] && f.FID == fd.FID && f.Pos == pos {
+						found = j
+						break
+					}
+				}
+				if found < 0 || p.Fields[found].Value.Len()%8 != 0 || p.Fields[found].Value.Len() > 8*0xFFFF {
+					return nil, nil, false
+				}
+				used[found] = true
+				vs = append(vs, p.Fields[found].Value)
+			}
+			fds = append(fds, fd)
+			fs = append(fs, Field{FID: fd.FID, Pos: fd.fp, Value: groupValue(vs)})
+			continue
+		}
 		found := -1
 		for j, f := range p.Fields {
 			if !used[j] && f.FID == fd.FID && (fd.fp == 0 || fd.fp == f.Pos) {
@@ -100,7 +121,7 @@ func (r *Rule) pair(p Packet, dir Direction) ([]*FieldDescriptor, []Field, bool)
 // compress applies the rule's matching operators and actions; false when
 // the rule does not fit.
 func (r *Rule) compress(st Stack, p Packet, dir Direction, ctx Context) (Bits, bool) {
-	fds, fs, ok := r.pair(p, dir)
+	fds, fs, ok := r.pair(r.split(p), dir)
 	if !ok {
 		return Bits{}, false
 	}
@@ -110,8 +131,16 @@ func (r *Rule) compress(st Stack, p Packet, dir Direction, ctx Context) (Bits, b
 		if fd.Var == "" && v.Len() != fd.FL {
 			return Bits{}, false
 		}
-		if fd.Var == "bytes" && v.Len()%8 != 0 {
+		if (fd.Var == "bytes" || fd.Var == VarTKL) && v.Len()%8 != 0 {
 			return Bits{}, false
+		}
+		if fd.Var == VarTKL {
+			// The token's length is TKL bytes (RFC 8824 4.5): no size is
+			// sent, so the TKL must say it.
+			tkl, found := fieldValue(p, FCoAPTKL)
+			if !found || v.Len() != 8*int(tkl.UintAt(0, tkl.Len())) {
+				return Bits{}, false
+			}
 		}
 		if !fd.matches(v) {
 			return Bits{}, false
@@ -121,7 +150,7 @@ func (r *Rule) compress(st Stack, p Packet, dir Direction, ctx Context) (Bits, b
 			// With MO ignore the value may differ from the TV (RFC 8724
 			// 7.4.3 allows it; the decompressed field is then the TV).
 		case CDAValueSent:
-			if fd.Var != "" {
+			if fd.sizeSent() {
 				if !appendSize(&out, v.Len(), fd.Var) {
 					return Bits{}, false
 				}
@@ -138,7 +167,7 @@ func (r *Rule) compress(st Stack, p Packet, dir Direction, ctx Context) (Bits, b
 			out.AppendUint(uint64(idx), indexBits(len(fd.tv)))
 		case CDALSB:
 			lsb := v.Slice(fd.MOArg, v.Len())
-			if fd.Var != "" {
+			if fd.sizeSent() {
 				if !appendSize(&out, lsb.Len(), fd.Var) {
 					return Bits{}, false
 				}
@@ -168,6 +197,89 @@ func (r *Rule) compress(st Stack, p Packet, dir Direction, ctx Context) (Bits, b
 	}
 	out.AppendBytes(p.Payload)
 	return out, true
+}
+
+// sizeSent reports whether a residue of the field carries its size: a
+// variable-length field in bits or bytes (RFC 8724 7.4.2), not the token,
+// whose size is the TKL (RFC 8824 4.5).
+func (fd *FieldDescriptor) sizeSent() bool { return fd.Var == "bits" || fd.Var == "bytes" }
+
+// fieldValue is the first field fid of a packet.
+func fieldValue(p Packet, fid string) (Bits, bool) {
+	for _, f := range p.Fields {
+		if f.FID == fid {
+			return f.Value, true
+		}
+	}
+	return Bits{}, false
+}
+
+// split cuts the fields the rule describes as subfields (ipv6.ds and
+// ipv6.ecn, coap.codeClass and coap.codeDetail) into those subfields.
+func (r *Rule) split(p Packet) Packet {
+	if len(r.splits) == 0 {
+		return p
+	}
+	q := Packet{Payload: p.Payload, Fields: make([]Field, 0, len(p.Fields)+2)}
+	for _, f := range p.Fields {
+		if !r.splits[f.FID] {
+			q.Fields = append(q.Fields, f)
+			continue
+		}
+		for _, s := range subfields[f.FID] {
+			if s.to > f.Value.Len() {
+				q.Fields = append(q.Fields, f) // cannot be cut: no descriptor will take it
+				break
+			}
+			q.Fields = append(q.Fields, Field{FID: s.fid, Pos: f.Pos, Value: f.Value.Slice(s.from, s.to)})
+		}
+	}
+	return q
+}
+
+// join puts subfields back together into their fields, at the place of
+// the first subfield; a field whose subfields are not all there is an
+// error.
+func join(fields []Field) ([]Field, error) {
+	out := make([]Field, 0, len(fields))
+	type key struct {
+		fid string
+		pos int
+	}
+	parts := map[key]map[string]Bits{}
+	at := map[key]int{}
+	for _, f := range fields {
+		parent, ok := subfieldOf[f.FID]
+		if !ok {
+			out = append(out, f)
+			continue
+		}
+		k := key{parent, f.Pos}
+		if parts[k] == nil {
+			parts[k] = map[string]Bits{}
+			at[k] = len(out)
+			out = append(out, Field{FID: parent, Pos: f.Pos})
+		}
+		if _, dup := parts[k][f.FID]; dup {
+			return nil, fmt.Errorf("schc: subfield %s appears twice", f.FID)
+		}
+		parts[k][f.FID] = f.Value
+	}
+	for k, m := range parts {
+		var v Bits
+		for _, s := range subfields[k.fid] {
+			sv, ok := m[s.fid]
+			if !ok {
+				return nil, fmt.Errorf("schc: field %s has no subfield %s", k.fid, s.fid)
+			}
+			if sv.Len() != s.to-s.from {
+				return nil, fmt.Errorf("schc: subfield %s has %d bits, not %d", s.fid, sv.Len(), s.to-s.from)
+			}
+			v.Append(sv)
+		}
+		out[at[k]].Value = v
+	}
+	return out, nil
 }
 
 // matches applies the matching operator (RFC 8724 7.3).
@@ -268,17 +380,17 @@ func (rs *RuleSet) Decompress(st Stack, msg Bits, dir Direction, ctx Context) ([
 	if err != nil {
 		return nil, r, err
 	}
-	vals := map[string]Bits{}
+	keep := fields[:0]
 	for _, f := range fields {
-		if _, known := fieldLengths[f.FID]; !known {
+		if !knownFID(f.FID) {
 			return nil, r, fmt.Errorf("schc: field %s is not of the %s stack", f.FID, st)
 		}
 		if f.Value.Len() == 0 && computed[f.FID] {
 			continue // compute: rebuilt by Build
 		}
-		vals[f.FID] = f.Value
+		keep = append(keep, f)
 	}
-	out, err := st.Build(vals, payload, dir)
+	out, err := st.BuildFields(keep, payload, dir)
 	if err != nil {
 		return nil, r, err
 	}
@@ -317,12 +429,16 @@ func (r *Rule) decompress(rd *reader, dir Direction, ctx Context, maxSize int) (
 			v = fd.tv[0]
 		case CDAValueSent:
 			n := fd.FL
-			if fd.Var != "" {
+			if fd.sizeSent() {
 				if n, err = readSize(rd, fd.Var); err != nil {
 					return nil, nil, err
 				}
+			} else if fd.Var == VarTKL {
+				n, err = tklBits(fields)
 			}
-			v, err = rd.bits(n)
+			if err == nil {
+				v, err = rd.bits(n)
+			}
 		case CDAMappingSent:
 			var idx uint64
 			if idx, err = rd.uint(indexBits(len(fd.tv))); err == nil {
@@ -333,15 +449,24 @@ func (r *Rule) decompress(rd *reader, dir Direction, ctx Context, maxSize int) (
 			}
 		case CDALSB:
 			n := fd.FL - fd.MOArg
-			if fd.Var != "" {
+			if fd.sizeSent() {
 				if n, err = readSize(rd, fd.Var); err != nil {
 					return nil, nil, err
 				}
+			} else if fd.Var == VarTKL {
+				if n, err = tklBits(fields); err == nil {
+					n -= fd.MOArg
+					if n < 0 {
+						err = fmt.Errorf("the token of %d bits is shorter than msb(%d)", n+fd.MOArg, fd.MOArg)
+					}
+				}
 			}
-			var lsb Bits
-			if lsb, err = rd.bits(n); err == nil {
-				v = fd.tv[0].Slice(0, fd.MOArg)
-				v.Append(lsb)
+			if err == nil {
+				var lsb Bits
+				if lsb, err = rd.bits(n); err == nil {
+					v = fd.tv[0].Slice(0, fd.MOArg)
+					v.Append(lsb)
+				}
 			}
 		case CDACompute:
 			// Rebuilt from the other fields (applied last, RFC 8724 7.2).
@@ -362,8 +487,23 @@ func (r *Rule) decompress(rd *reader, dir Direction, ctx Context, maxSize int) (
 		if p == 0 {
 			p = pos[fd.FID] + 1
 		}
+		if fd.group > 1 {
+			vs, ok := ungroup(v, fd.group)
+			if !ok {
+				return nil, nil, fmt.Errorf("schc: field %s: a bad group value", fd.FID)
+			}
+			for k, x := range vs {
+				fields = append(fields, Field{FID: fd.FID, Pos: p + k, Value: x})
+			}
+			pos[fd.FID] = max(pos[fd.FID], p+fd.group-1)
+			continue
+		}
 		pos[fd.FID] = max(pos[fd.FID], p)
 		fields = append(fields, Field{FID: fd.FID, Pos: p, Value: v})
+	}
+	fields, err := join(fields)
+	if err != nil {
+		return nil, nil, err
 	}
 	// Whole payload bytes; what is left is padding (fewer bits than a
 	// byte, RFC 8724 clause 9).
@@ -373,4 +513,18 @@ func (r *Rule) decompress(rd *reader, dir Direction, ctx Context, maxSize int) (
 	}
 	b, _ := rd.bits(8 * n)
 	return fields, b.Bytes(), nil
+}
+
+// tklBits is the token length in bits from the TKL decompressed so far
+// (the "tkl" field length function of RFC 8824 4.5).
+func tklBits(fields []Field) (int, error) {
+	for _, f := range fields {
+		if f.FID == FCoAPTKL {
+			if f.Value.Len() != 4 {
+				return 0, errors.New("the TKL is not 4 bits")
+			}
+			return 8 * int(f.Value.UintAt(0, 4)), nil
+		}
+	}
+	return 0, errors.New("the rule gives no TKL before the token")
 }

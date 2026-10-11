@@ -40,12 +40,31 @@ type FragMsg struct {
 	Payload Bits
 	C       bool   // ACK
 	Bitmap  []bool // ACK with C=0: the window's bitmap, leftmost tile (WINDOW_SIZE-1) first, uncompressed
+	// More are the further windows of a SCHC Compound ACK (RFC 9441), in
+	// increasing window order after W; only with a rule's CompoundAck.
+	More []WindowBitmap
 }
 
-// rcs is the Reassembly Check Sequence: CRC32 (reflected polynomial
-// EDB88320h) over the packet zero-extended to whole bytes (RFC 8724
-// 8.2.3).
-func rcs(packet Bits) uint32 { return crc32.ChecksumIEEE(packet.Bytes()) }
+// WindowBitmap is one window's bitmap in a SCHC Compound ACK.
+type WindowBitmap struct {
+	W      uint32
+	Bitmap []bool
+}
+
+// rcs is the Reassembly Check Sequence over the packet zero-extended to
+// whole bytes (RFC 8724 8.2.3), with the rule's algorithm (CRC32, reflected
+// polynomial EDB88320h, by default), cut to the RCS size.
+func (p *FragParams) rcs(packet Bits) uint32 {
+	sum := crc32.ChecksumIEEE
+	if p.rcsAlg.Sum != nil {
+		sum = p.rcsAlg.Sum
+	}
+	v := sum(packet.Bytes())
+	if p.RCSSize > 0 && p.RCSSize < 32 {
+		v &= 1<<uint(p.RCSSize) - 1
+	}
+	return v
+}
 
 func (p *FragParams) all1() uint32 { return 1<<uint(p.FCNSize) - 1 }
 
@@ -94,6 +113,10 @@ func (m *FragMsg) Encode(word int) Bits {
 			return h
 		}
 		h.AppendBit(0)
+		if p.CompoundAck {
+			encodeCompound(&h, m, p, word)
+			return h
+		}
 		compressBitmap(&h, m.Bitmap, word)
 		return h
 	case MsgReceiverAbort:
@@ -112,13 +135,24 @@ func (m *FragMsg) Encode(word int) Bits {
 // trailing ones, but only up to an L2 Word boundary of the whole message;
 // pad when nothing was dropped.
 func compressBitmap(h *Bits, bm []bool, word int) {
+	if !appendBitmap(h, bm, word, true) {
+		h.Pad(word)
+	}
+}
+
+// appendBitmap appends a bitmap, compressed when compress is set (the
+// trailing ones cut up to an L2 Word boundary of the whole message), and
+// reports whether bits were cut, which leaves the message on a boundary.
+func appendBitmap(h *Bits, bm []bool, word int, compress bool) bool {
 	start := h.Len()
 	cut := len(bm)
-	for cut > 0 && bm[cut-1] {
-		cut--
-	}
-	for (start+cut)%word != 0 && cut < len(bm) {
-		cut++
+	if compress {
+		for cut > 0 && bm[cut-1] {
+			cut--
+		}
+		for (start+cut)%word != 0 && cut < len(bm) {
+			cut++
+		}
 	}
 	for _, b := range bm[:cut] {
 		if b {
@@ -127,9 +161,32 @@ func compressBitmap(h *Bits, bm []bool, word int) {
 			h.AppendBit(0)
 		}
 	}
-	if cut == len(bm) {
-		h.Pad(word)
+	return cut < len(bm)
+}
+
+// encodeCompound writes the bitmaps of a SCHC Compound ACK after its C bit
+// (RFC 9441 3.1): the first window's (its W is in the header), then W and
+// bitmap of each further window; every bitmap whole but the last, which
+// is compressed unless the rule says otherwise. When the padding to the
+// L2 Word would be M bits or more, M zero bits (no window 0 can follow)
+// end the list first.
+func encodeCompound(h *Bits, m *FragMsg, p *FragParams, word int) {
+	all := append([]WindowBitmap{{W: m.W, Bitmap: m.Bitmap}}, m.More...)
+	cut := false
+	for i, wb := range all {
+		if i > 0 {
+			h.AppendUint(uint64(wb.W), p.WSize)
+		}
+		last := i == len(all)-1
+		cut = appendBitmap(h, wb.Bitmap, word, last && !p.LastBitmapUncompressed)
 	}
+	if cut {
+		return
+	}
+	if padOf(h.Len(), word) >= p.WSize {
+		h.AppendUint(0, p.WSize)
+	}
+	h.Pad(word)
 }
 
 var errIgnore = errors.New("schc: message ignored")
@@ -218,10 +275,35 @@ func DecodeAtSender(r *Rule, msg Bits, word int) (*FragMsg, error) {
 	if p.Mode == NoAck {
 		return nil, errors.New("schc: no-ack has no SCHC ACK")
 	}
-	m.Bitmap = make([]bool, ws)
-	for i := 0; i < ws; i++ {
-		// Bits cut off by the compression are ones (RFC 8724 8.3.2.1).
-		m.Bitmap[i] = i >= rest.Len() || rest.Bit(i) == 1
+	readBitmap := func(from int) ([]bool, int) {
+		bm := make([]bool, ws)
+		for i := 0; i < ws; i++ {
+			// Bits cut off by the compression are ones (RFC 8724 8.3.2.1).
+			bm[i] = from+i >= rest.Len() || rest.Bit(from+i) == 1
+		}
+		return bm, min(rest.Len(), from+ws)
+	}
+	var at int
+	m.Bitmap, at = readBitmap(0)
+	if !p.CompoundAck {
+		return m, nil
+	}
+	// A Compound ACK (RFC 9441 3.1): W and bitmap pairs until fewer than
+	// M bits are left or the M zero bits that end the list.
+	last := m.W
+	for rest.Len()-at >= p.WSize && p.WSize > 0 {
+		w := uint32(rest.UintAt(at, p.WSize))
+		at += p.WSize
+		if w == 0 {
+			break
+		}
+		if w <= last {
+			return nil, errIgnore // out of order or repeated: discard (RFC 9441 3.1)
+		}
+		last = w
+		var bm []bool
+		bm, at = readBitmap(at)
+		m.More = append(m.More, WindowBitmap{W: w, Bitmap: bm})
 	}
 	return m, nil
 }

@@ -1,0 +1,21 @@
+{
+  "ietf-sid-file:sid-file": {
+    "module-name": "ietf-schc-compound-ack",
+    "module-revision": "2023-07-26",
+    "description": "SIDs for the RFC 9441 module, assigned by github.com/cB-Sigma/schc from the experimental range of RFC 9595 because none are registered.",
+    "assignment-range": [
+      {
+        "entry-point": "60100",
+        "size": "50"
+      }
+    ],
+    "item": [
+      { "namespace": "module", "identifier": "ietf-schc-compound-ack", "sid": "60100" },
+      { "namespace": "identity", "identifier": "bitmap-RFC8724", "sid": "60101" },
+      { "namespace": "identity", "identifier": "bitmap-compound-ack", "sid": "60102" },
+      { "namespace": "identity", "identifier": "bitmap-format-base-type", "sid": "60103" },
+      { "namespace": "data", "identifier": "/ietf-schc:schc/rule/ietf-schc-compound-ack:bitmap-format", "sid": "60104" },
+      { "namespace": "data", "identifier": "/ietf-schc:schc/rule/ietf-schc-compound-ack:last-bitmap-compression", "sid": "60105" }
+    ]
+  }
+}

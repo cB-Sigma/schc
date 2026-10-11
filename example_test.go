@@ -5,6 +5,7 @@ package schc_test
 
 import (
 	"bytes"
+	"encoding/hex"
 	"fmt"
 	"time"
 
@@ -41,6 +42,44 @@ func ExampleRuleSet_Compress() {
 	// Output:
 	// rule 1 header and payload in 51 bits instead of 104
 	// true <nil>
+}
+
+// Compress a CoAP GET and its response with one rule that describes both
+// directions (RFC 8824 7.3, table 6): the request to 2 bytes, the
+// response's header to 1 byte before its payload.
+func ExampleRuleSet_Compress_coap() {
+	rules, err := schc.ParseRuleSet([]byte(`{"rules":[{"ruleId":1,"fields":[
+	 {"fid":"coap.version","fl":2,"tv":1,"mo":"equal","cda":"not-sent"},
+	 {"fid":"coap.type","fl":2,"di":"up","tv":0,"mo":"equal","cda":"not-sent"},
+	 {"fid":"coap.type","fl":2,"di":"dw","tv":2,"mo":"equal","cda":"not-sent"},
+	 {"fid":"coap.tkl","fl":4,"tv":1,"mo":"equal","cda":"not-sent"},
+	 {"fid":"coap.code","fl":8,"di":"up","tv":1,"mo":"equal","cda":"not-sent"},
+	 {"fid":"coap.code","fl":8,"di":"dw","tv":[69,132],"mo":"match-mapping","cda":"mapping-sent"},
+	 {"fid":"coap.mid","fl":16,"tv":0,"mo":"msb(12)","cda":"lsb"},
+	 {"fid":"coap.token","var":"tkl","tv":"80","mo":"msb(5)","cda":"lsb"},
+	 {"fid":"coap.uriPath","var":"bytes","di":"up","tv":"temperature","mo":"equal","cda":"not-sent"}]}]}`))
+	if err != nil {
+		panic(err)
+	}
+	stack, _ := schc.ParseStack("coap") // or "ipv6/udp/coap" for one rule over the whole packet
+	get, _ := hex.DecodeString("4101000182bb74656d7065726174757265")
+	content, _ := hex.DecodeString("6145000182ff32332043")
+
+	for _, m := range []struct {
+		dir schc.Direction
+		msg []byte
+	}{{schc.Up, get}, {schc.Down, content}} {
+		c, _, err := rules.Compress(stack, m.msg, m.dir, schc.Context{})
+		if err != nil {
+			panic(err)
+		}
+		c.Pad(8)
+		back, _, err := rules.Decompress(stack, c, m.dir, schc.Context{})
+		fmt.Printf("%s: %d bytes to %x, back %v %v\n", m.dir, len(m.msg), c.Bytes(), bytes.Equal(back, m.msg), err)
+	}
+	// Output:
+	// up: 17 bytes to 0114, back true <nil>
+	// dw: 10 bytes to 010a32332043, back true <nil>
 }
 
 // Fragment a 300-byte packet for LoRaWAN with the RFC 9011 uplink rule

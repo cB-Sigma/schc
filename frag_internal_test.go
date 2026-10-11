@@ -40,15 +40,22 @@ func describe(m *FragMsg) string {
 		if m.C {
 			return fmt.Sprintf("ACK W=%d C=1", m.W)
 		}
-		var b strings.Builder
-		for _, x := range m.Bitmap {
-			if x {
-				b.WriteByte('1')
-			} else {
-				b.WriteByte('0')
+		bits := func(bm []bool) string {
+			var b strings.Builder
+			for _, x := range bm {
+				if x {
+					b.WriteByte('1')
+				} else {
+					b.WriteByte('0')
+				}
 			}
+			return b.String()
 		}
-		return fmt.Sprintf("ACK W=%d C=0 %s", m.W, b.String())
+		s := fmt.Sprintf("ACK W=%d C=0 %s", m.W, bits(m.Bitmap))
+		for _, wb := range m.More {
+			s += fmt.Sprintf(", W=%d %s", wb.W, bits(wb.Bitmap))
+		}
+		return s
 	}
 	return m.Kind.String()
 }
@@ -496,6 +503,9 @@ func TestFragmentationRandomLoss(t *testing.T) {
 		"aoe-lorawan-like": `{"ruleId":20,"fragmentation":{"mode":"ack-on-error","wSize":2,"fcnSize":6,"windowSize":63,"tileBytes":10,"retransmissionTimer":"1m","inactivityTimer":"1h"}}`,
 		"aoe-every-window": `{"ruleId":20,"fragmentation":{"mode":"ack-on-error","wSize":2,"fcnSize":6,"windowSize":5,"tileBytes":3,"ackEveryWindow":true,"retransmissionTimer":"1m","inactivityTimer":"1h"}}`,
 		"aoe-regular-last": `{"ruleId":20,"fragmentation":{"mode":"ack-on-error","wSize":2,"fcnSize":3,"tileBytes":2,"lastTile":"regular","retransmissionTimer":"1m","inactivityTimer":"1h"}}`,
+		// A last tile shorter than an L2 Word rides in the All-1, where the
+		// receiver must not take it for padding.
+		"aoe-sub-word-last": `{"ruleId":20,"fragmentation":{"mode":"ack-on-error","wSize":2,"fcnSize":3,"tileBytes":3,"retransmissionTimer":"1m","inactivityTimer":"1h"}}`,
 	}
 	for name, js := range rules {
 		r := testRule(t, js)

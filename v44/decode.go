@@ -7,13 +7,16 @@ import "fmt"
 
 // bitReader reads codes least significant bit first (6.6).
 type bitReader struct {
-	in  []byte
-	pos int // bits read
+	in    []byte
+	pos   int // bits read
+	short bool
 }
 
-// bits reads n bits; ok is false at the end of the input.
+// bits reads n bits; ok is false at the end of the input (and short is
+// set: a stream decoder then waits for more).
 func (r *bitReader) bits(n uint) (v uint32, ok bool) {
 	if r.pos+int(n) > len(r.in)*8 {
+		r.short = true
 		return 0, false
 	}
 	for i := uint(0); i < n; i++ {
@@ -56,6 +59,35 @@ type decoder struct {
 	afterCW  bool
 	flushed  bool
 	onString func(cw int, s str) // test hook: a string was created
+
+	// The multi-packet and stream methods.
+	callStart int  // where this call's output starts in out
+	stream    bool // FLUSH aligns and decoding goes on; ETM enters transparent mode
+	mode      int  // modeCompressed, modeTransparent, modeParameter (stream)
+	escape    byte // the current ESCAPE (7.14)
+	params    []Parameter
+	onParams  func([]Parameter)
+	raw       bool // the packet was the annex B uncompressed form
+}
+
+// Decoder modes (6.5, 7.4.2).
+const (
+	modeCompressed = iota
+	modeTransparent
+	modeParameter
+)
+
+// trim drops the output before the current history, keeping string
+// positions, so that a long-lived decoder does not grow without bound.
+func (d *decoder) trim() {
+	if d.base == 0 {
+		return
+	}
+	for i := firstCW; i < len(d.strs); i++ {
+		d.strs[i].last -= d.base
+	}
+	d.out = append(d.out[:0:0], d.out[d.base:]...)
+	d.base = 0
 }
 
 // Decompress decodes one packet compressed with the packet method. An
@@ -125,6 +157,9 @@ func (d *decoder) step() error {
 			return d.corrupt("the data ends inside a codeword")
 		}
 		if v < firstCW {
+			// After a control code the prefixes are those of Table 5's
+			// "otherwise" column.
+			d.afterCW = false
 			return d.control(v)
 		}
 		return d.codeword(int(v))
@@ -145,20 +180,35 @@ func (d *decoder) step() error {
 func (d *decoder) control(v uint32) error {
 	switch v {
 	case ctlETM:
+		if d.stream {
+			// 6.5.1: transparent mode from the next octet.
+			if d.stepup {
+				return d.corrupt("ETM straight after STEPUP")
+			}
+			d.alignRead()
+			d.mode = modeTransparent
+			return nil
+		}
 		// Annex B: ETM with its prefix at the start of a packet says the
 		// rest is the original data, octet-aligned. Transparent mode is
-		// not part of the packet method.
-		if d.r.pos != 1+initC2 || len(d.out) != 0 {
-			return d.corrupt("ETM inside a packet (transparent mode is not used by the packet method)")
+		// not part of the packet methods.
+		if d.r.pos != 1+int(d.c2) || len(d.out) != d.callStart {
+			return d.corrupt("ETM inside a packet (transparent mode is not used by the packet methods)")
 		}
-		if len(d.r.in)-1 > d.p.Limit {
-			return fmt.Errorf("%w (%d octets)", ErrLimit, len(d.r.in)-1)
+		d.alignRead()
+		rest := d.r.in[d.r.pos/8:]
+		if len(rest) > d.p.Limit {
+			return fmt.Errorf("%w (%d octets)", ErrLimit, len(rest))
 		}
-		d.out = append(d.out, d.r.in[1:]...)
-		d.flushed = true
+		d.out = append(d.out, rest...)
+		d.flushed, d.raw = true, true
 	case ctlFLUSH:
 		if d.stepup {
 			return d.corrupt("FLUSH straight after STEPUP")
+		}
+		if d.stream {
+			d.alignRead() // 7.13: the next code starts on an octet
+			return nil
 		}
 		d.flushed = true
 	case ctlSTEPUP:
@@ -178,9 +228,12 @@ func (d *decoder) control(v uint32) error {
 	return nil
 }
 
+// alignRead skips to the next octet boundary.
+func (d *decoder) alignRead() { d.r.pos = (d.r.pos + 7) &^ 7 }
+
 // room checks that n more characters fit the limit and the history.
 func (d *decoder) room(n int) error {
-	if len(d.out)+n > d.p.Limit {
+	if len(d.out)-d.callStart+n > d.p.Limit {
 		return fmt.Errorf("%w (%d octets)", ErrLimit, d.p.Limit)
 	}
 	if d.p.History > 0 && len(d.out)+n-d.base > d.p.History {

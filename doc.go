@@ -2,27 +2,45 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package schc is Static Context Header Compression and fragmentation (RFC
-// 8724) with the LoRaWAN profile of RFC 9011.
+// 8724) for IPv6, UDP, ICMPv6 and CoAP (RFC 8824), with the LoRaWAN
+// profile of RFC 9011, the Compound ACK of RFC 9441 and rules in the RFC
+// 9363 data model.
 //
 // Compression (compress.go): rules of field descriptors (FID, FL, FP, DI,
 // TV, MO, CDA) matched as clause 7.2 says; the matching operators equal,
 // ignore, MSB(x) and match-mapping; the actions not-sent, value-sent,
 // mapping-sent, LSB, compute, DevIID and AppIID; variable-length residues
 // with their 4/12/28-bit sizes. Fields are labelled by our parsers for
-// IPv6 and UDP (clause 10, addresses and ports by Dev/App role) and the
-// IEC 62056-4-7 wrapper header (fields.go); compute rebuilds the IPv6 and
-// UDP lengths, the UDP checksum and the wrapper length, and a compute or
-// DevIID field is elided only when the other end rebuilds the same value.
+// IPv6 and UDP (clause 10, addresses and ports by Dev/App role), ICMPv6
+// Echo, the IEC 62056-4-7 wrapper header (fields.go) and CoAP (coap.go);
+// compute rebuilds the IPv6 and UDP lengths, the UDP and ICMPv6 checksums
+// and the wrapper length, and a compute or DevIID field is elided only
+// when the other end rebuilds the same value. A rule may describe the
+// IPv6 Traffic Class as DSCP and ECN and the CoAP code as class and
+// detail (RFC 9363's subfield identities).
+//
+// CoAP (coap.go, RFC 8824): the header fields, the token with the "tkl"
+// length function (4.5), every option by number with the OSCORE option
+// cut into flags, piv, kidctx and kid (6.4), and entries that group
+// several Uri-Path or Uri-Query elements (5.3). The stack "coap" is a
+// whole CoAP message, alone or as "ipv6/udp/coap" in one rule; the stack
+// "coap-inner" is an OSCORE plaintext, for the inner rules of 7.2, whose
+// encrypted result an outer rule compresses as the payload of the
+// protected message. OSCORE protection itself is the caller's.
 //
 // Fragmentation (frag.go, sender.go, receiver.go): the message formats of
-// clause 8.3 with bitmap compression, the CRC32 RCS of 8.2.3, and the
-// sender and receiver of No-ACK, ACK-Always and ACK-on-Error (8.4) as
-// clock-driven state machines without I/O.
+// clause 8.3 with bitmap compression, the RCS of 8.2.3 (CRC32 by default,
+// others through RegisterRCS, rcs.go), and the sender and receiver of
+// No-ACK, ACK-Always and ACK-on-Error (8.4) as clock-driven state
+// machines without I/O. With a rule's CompoundAck the ACK-on-Error
+// receiver reports every window with missing tiles in one SCHC Compound
+// ACK and the sender reads it (RFC 9441).
 //
 // LoRaWAN (lorawan.go): RuleID in the FPort, the uplink ACK-on-Error and
 // downlink ACK-Always rules with their parameters and class timers, the
 // multicast No-ACK rule, and the AES-CMAC IID of RFC 9011 5.3.
 //
-// Rules are our own JSON (rule.go). RFC 9363's YANG data model is not
-// implemented and is not claimed.
+// Rules (rule.go, yang.go): our own JSON, which every feature has, and the
+// RFC 9363 data model in RFC 7951 JSON (ParseYANG, MarshalYANG) with the
+// RFC 9441 augment; package coreconf carries the latter in CBOR with SIDs.
 package schc

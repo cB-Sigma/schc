@@ -69,7 +69,7 @@ const (
 )
 
 // RuleSet is a SCHC context: the rules both ends hold (RFC 8724 7.1).
-// It is our own JSON form; RFC 9363's YANG model is not implemented.
+// In JSON it is our own form; ParseYANG and MarshalYANG use RFC 9363's.
 type RuleSet struct {
 	// L2Word is the L2 Word size in bits (default 8, the LoRaWAN value of
 	// RFC 9011 5.6).
@@ -89,13 +89,20 @@ type Rule struct {
 	Name          string            `json:"name,omitempty"`
 	Fields        []FieldDescriptor `json:"fields,omitempty"`
 	Fragmentation *FragParams       `json:"fragmentation,omitempty"`
+
+	splits map[string]bool // fields the rule describes as subfields
 }
+
+// VarTKL is the field length function of the CoAP token (RFC 8824 4.5):
+// the token is as long as the TKL says, and no size goes in the residue.
+const VarTKL = "tkl"
 
 // FieldDescriptor is one line of a compression rule (RFC 8724 7.1).
 type FieldDescriptor struct {
 	FID string `json:"fid"`
 	// FL is the field length in bits; 0 with Var set is a variable-length
-	// field measured in Var units ("bits" or "bytes", RFC 8724 7.4.2).
+	// field measured in Var units ("bits" or "bytes", RFC 8724 7.4.2), or
+	// the CoAP token whose length is its TKL ("tkl", RFC 8824 4.5).
 	FL  int    `json:"fl,omitempty"`
 	Var string `json:"var,omitempty"`
 	// FP is the field position, default 1; 0 is "don't care" (RFC 8724
@@ -103,15 +110,20 @@ type FieldDescriptor struct {
 	FP *int      `json:"fp,omitempty"`
 	DI Direction `json:"di,omitempty"` // default bi
 	// TV is a number, a hex string ("0x…" or bare hex), an IPv6 prefix or
-	// address (for 64-bit prefix and IID fields), or a list of these for
-	// match-mapping.
+	// address (for 64-bit prefix and IID fields), {"text": "…"} for UTF-8
+	// bytes, {"hex": "…"}, or a list of these for match-mapping. For the
+	// CoAP options that hold text (Uri-Host, Uri-Path, Uri-Query,
+	// Location-Path, Location-Query, Proxy-Uri, Proxy-Scheme) a plain
+	// string is the text. A number for a variable-length field is its
+	// shortest big-endian form, as CoAP uint options are (0 is empty).
 	TV    json.RawMessage `json:"tv,omitempty"`
 	MO    string          `json:"mo"`
 	MOArg int             `json:"moArg,omitempty"` // x of MSB(x)
 	CDA   string          `json:"cda"`
 
-	tv []Bits // compiled target value(s)
-	fp int
+	tv    []Bits // compiled target value(s)
+	fp    int
+	group int // instances of the field the entry covers (RFC 8824 5.3), 1 normally
 }
 
 // FragParams are a fragmentation rule's parameters (RFC 8724 8.2.4, 8.4
@@ -124,10 +136,16 @@ type FragParams struct {
 	FCNSize    int       `json:"fcnSize"`             // N
 	WindowSize int       `json:"windowSize,omitempty"`
 	// TileSize is the regular tile size in bits for ACK-on-Error; in
-	// JSON tileBytes (bytes) or tileBits.
-	TileSize         int      `json:"tileBits,omitempty"`
-	TileBytes        int      `json:"tileBytes,omitempty"`
-	RCSSize          int      `json:"rcsSize,omitempty"` // bits, default 32 (CRC32)
+	// JSON tileBytes (bytes) or tileBits. 0 makes each tile fill its
+	// fragment at the MTU the sender starts with, one tile per fragment
+	// (RFC 9363's tile-size left out).
+	TileSize  int `json:"tileBits,omitempty"`
+	TileBytes int `json:"tileBytes,omitempty"`
+	// RCS names the Reassembly Check Sequence algorithm (default "crc32",
+	// RFC 8724 8.2.3; see RegisterRCS) and RCSSize its size in bits (by
+	// default the algorithm's).
+	RCS              string   `json:"rcs,omitempty"`
+	RCSSize          int      `json:"rcsSize,omitempty"`
 	MaxAckRequests   int      `json:"maxAckRequests,omitempty"`
 	Retransmission   Duration `json:"retransmissionTimer,omitempty"`
 	Inactivity       Duration `json:"inactivityTimer,omitempty"`
@@ -136,6 +154,13 @@ type FragParams struct {
 	// AckEveryWindow: the ACK-on-Error receiver acknowledges every window
 	// and the sender waits for it before the next (RFC 9011 5.6.2).
 	AckEveryWindow bool `json:"ackEveryWindow,omitempty"`
+	// CompoundAck: the ACK-on-Error receiver reports every window with
+	// missing tiles in one SCHC Compound ACK, and the sender reads them
+	// (RFC 9441); LastBitmapUncompressed sends its last bitmap whole.
+	CompoundAck            bool `json:"compoundAck,omitempty"`
+	LastBitmapUncompressed bool `json:"lastBitmapUncompressed,omitempty"`
+
+	rcsAlg RCSAlgorithm
 }
 
 // Duration is a JSON duration: "12h", "30s" or a number of seconds.
@@ -238,9 +263,21 @@ func (r *Rule) compile(word int) error {
 		if r.Fragmentation != nil {
 			return errors.New("a compression rule has no fragmentation parameters")
 		}
+		r.splits = nil
 		for i := range r.Fields {
 			if err := r.Fields[i].compile(); err != nil {
 				return fmt.Errorf("field %s: %w", r.Fields[i].FID, err)
+			}
+			if parent, ok := subfieldOf[r.Fields[i].FID]; ok {
+				if r.splits == nil {
+					r.splits = map[string]bool{}
+				}
+				r.splits[parent] = true
+			}
+		}
+		for i := range r.Fields {
+			if r.splits[r.Fields[i].FID] {
+				return fmt.Errorf("field %s is described both whole and as subfields", r.Fields[i].FID)
 			}
 		}
 	case KindNoCompression:
@@ -298,6 +335,7 @@ func (f *FieldDescriptor) compile() error {
 	if f.DI != Up && f.DI != Down && f.DI != Bi {
 		return fmt.Errorf("di %q is not up, dw or bi", f.DI)
 	}
+	f.Var = strings.ToLower(f.Var)
 	switch f.Var {
 	case "":
 		if f.FL < 1 || f.FL > 1024 {
@@ -307,8 +345,15 @@ func (f *FieldDescriptor) compile() error {
 		if f.FL != 0 {
 			return errors.New("a variable-length field has no fl")
 		}
+	case VarTKL:
+		if f.FL != 0 {
+			return errors.New("a field of length tkl has no fl")
+		}
+		if f.FID != FCoAPToken {
+			return fmt.Errorf("var tkl is for %s only", FCoAPToken)
+		}
 	default:
-		return fmt.Errorf("var %q is not bits or bytes", f.Var)
+		return fmt.Errorf("var %q is not bits, bytes or tkl", f.Var)
 	}
 	switch f.MO {
 	case MOEqual, MOIgnore, MOMatchMapping:
@@ -335,11 +380,14 @@ func (f *FieldDescriptor) compile() error {
 	default:
 		return fmt.Errorf("cda %q is not not-sent, value-sent, mapping-sent, lsb, compute, deviid or appiid", f.CDA)
 	}
-	tv, err := parseTV(f.TV, f.FL, f.MO == MOMatchMapping)
+	tv, group, err := parseTV(f.TV, f.FL, f.MO == MOMatchMapping, textOptions[f.FID])
 	if err != nil {
 		return fmt.Errorf("tv: %w", err)
 	}
-	f.tv = tv
+	f.tv, f.group = tv, group
+	if group > 1 && (f.CDA != CDAMappingSent || f.Var != "bytes" || f.fp == 0) {
+		return errors.New("a target value of grouped elements goes with match-mapping, mapping-sent, var bytes and a field position from 1 (RFC 8824 5.3)")
+	}
 	needTV := f.MO == MOEqual || f.MO == MOMSB || f.MO == MOMatchMapping || f.CDA == CDANotSent
 	if needTV && len(tv) == 0 {
 		return fmt.Errorf("mo %s with cda %s needs a tv", f.MO, f.CDA)
@@ -351,37 +399,121 @@ func (f *FieldDescriptor) compile() error {
 }
 
 // parseTV reads a target value: one value, or a list for match-mapping.
-func parseTV(raw json.RawMessage, fl int, list bool) ([]Bits, error) {
+// A list of lists groups that many consecutive instances of a repeated
+// field in one entry (RFC 8824 5.3, table 1: ["a","b"] for the path /a/b);
+// group is their number, 1 otherwise.
+func parseTV(raw json.RawMessage, fl int, list, text bool) (tv []Bits, group int, err error) {
+	raw = json.RawMessage(strings.TrimSpace(string(raw)))
 	if len(raw) == 0 || string(raw) == "null" {
-		return nil, nil
+		return nil, 1, nil
 	}
 	var items []json.RawMessage
 	if raw[0] == '[' {
 		if err := json.Unmarshal(raw, &items); err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		if !list {
-			return nil, errors.New("a list is a target value for match-mapping only")
+			return nil, 0, errors.New("a list is a target value for match-mapping only")
 		}
 		if len(items) == 0 {
-			return nil, errors.New("match-mapping needs at least one value")
+			return nil, 0, errors.New("match-mapping needs at least one value")
 		}
 	} else {
 		items = []json.RawMessage{raw}
 	}
+	group = 1
+	grouped := isGroupItem(items[0])
 	out := make([]Bits, 0, len(items))
-	for _, it := range items {
-		v, err := parseValue(it, fl)
+	for i, it := range items {
+		if isGroupItem(it) != grouped {
+			return nil, 0, errors.New("a target value mixes groups and single values")
+		}
+		if grouped {
+			var elems []json.RawMessage
+			if err := json.Unmarshal(it, &elems); err != nil {
+				return nil, 0, err
+			}
+			if i == 0 {
+				group = len(elems)
+			}
+			if len(elems) == 0 || len(elems) != group {
+				return nil, 0, errors.New("every group of a target value has the same number of elements, at least one")
+			}
+			var vs []Bits
+			for _, e := range elems {
+				v, err := parseValue(e, fl, text)
+				if err != nil {
+					return nil, 0, err
+				}
+				vs = append(vs, v)
+			}
+			if group == 1 {
+				out = append(out, vs[0])
+			} else {
+				out = append(out, groupValue(vs))
+			}
+			continue
+		}
+		v, err := parseValue(it, fl, text)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		out = append(out, v)
 	}
-	return out, nil
+	return out, group, nil
 }
 
-// parseValue reads one value of fl bits (fl 0: variable, bytes as given).
-func parseValue(raw json.RawMessage, fl int) (Bits, error) {
+func isGroupItem(it json.RawMessage) bool {
+	s := strings.TrimSpace(string(it))
+	return len(s) > 0 && s[0] == '['
+}
+
+// groupValue is several instances of a field as one value to match: each
+// instance's length in 16 bits, then its bytes.
+func groupValue(vs []Bits) Bits {
+	var g Bits
+	for _, v := range vs {
+		g.AppendUint(uint64(v.Len()/8), 16)
+		g.Append(v)
+	}
+	return g
+}
+
+// ungroup splits a group value into n instances.
+func ungroup(g Bits, n int) ([]Bits, bool) {
+	var out []Bits
+	at := 0
+	for i := 0; i < n; i++ {
+		if g.Len()-at < 16 {
+			return nil, false
+		}
+		l := 8 * int(g.UintAt(at, 16))
+		at += 16
+		if g.Len()-at < l {
+			return nil, false
+		}
+		out = append(out, g.Slice(at, at+l))
+		at += l
+	}
+	return out, at == g.Len()
+}
+
+// fitBytes is b as a value of fl bits (fl 0: variable, b as it is): a
+// big-endian number that must fit.
+func fitBytes(b []byte, fl int, what string) (Bits, error) {
+	if fl == 0 {
+		return BytesOf(b), nil
+	}
+	bi := new(big.Int).SetBytes(b)
+	if bi.BitLen() > fl {
+		return Bits{}, fmt.Errorf("%s does not fit in %d bits", what, fl)
+	}
+	return bigBits(bi, fl), nil
+}
+
+// parseValue reads one value of fl bits (fl 0: variable, bytes as given);
+// text says a plain string is text rather than hexadecimal.
+func parseValue(raw json.RawMessage, fl int, text bool) (Bits, error) {
 	var n json.Number
 	dec := json.NewDecoder(strings.NewReader(string(raw)))
 	dec.UseNumber()
@@ -390,6 +522,23 @@ func parseValue(raw json.RawMessage, fl int) (Bits, error) {
 		return Bits{}, err
 	}
 	switch t := v.(type) {
+	case map[string]any:
+		if len(t) == 1 {
+			if s, ok := t["text"].(string); ok {
+				if fl != 0 && 8*len(s) != fl {
+					return Bits{}, fmt.Errorf("text %q is not %d bits", s, fl)
+				}
+				return BytesOf([]byte(s)), nil
+			}
+			if s, ok := t["hex"].(string); ok {
+				b, err := hex.DecodeString(strings.TrimPrefix(strings.ReplaceAll(s, " ", ""), "0x"))
+				if err != nil {
+					return Bits{}, fmt.Errorf("%q is not hexadecimal", s)
+				}
+				return fitBytes(b, fl, s)
+			}
+		}
+		return Bits{}, fmt.Errorf("%s is not {\"text\": …} or {\"hex\": …}", raw)
 	case json.Number:
 		n = t
 		bi, ok := new(big.Int).SetString(n.String(), 10)
@@ -404,6 +553,9 @@ func parseValue(raw json.RawMessage, fl int) (Bits, error) {
 		}
 		return bigBits(bi, fl), nil
 	case string:
+		if text {
+			return parseValue(json.RawMessage(`{"text":`+string(raw)+`}`), fl, false)
+		}
 		s := strings.TrimSpace(t)
 		if strings.Contains(s, ":") {
 			return ipv6Value(s, fl)
@@ -501,11 +653,20 @@ func (p *FragParams) compile(word, _ int) error {
 	if p.Direction == "" {
 		p.Direction = Bi
 	}
-	if p.RCSSize == 0 {
-		p.RCSSize = 32
+	if p.RCS == "" {
+		p.RCS = RCSCRC32
 	}
-	if p.RCSSize != 32 {
-		return errors.New("only the CRC32 RCS of 32 bits is supported (RFC 8724 8.2.3)")
+	p.RCS = strings.ToLower(p.RCS)
+	alg, ok := LookupRCS(p.RCS)
+	if !ok {
+		return fmt.Errorf("rcs %q is not a registered algorithm (%s)", p.RCS, strings.Join(RCSAlgorithms(), ", "))
+	}
+	p.rcsAlg = alg
+	if p.RCSSize == 0 {
+		p.RCSSize = alg.Bits
+	}
+	if p.RCSSize != alg.Bits {
+		return fmt.Errorf("rcsSize %d is not the %d bits of %s", p.RCSSize, alg.Bits, alg.Name)
 	}
 	if p.TileBytes != 0 {
 		if p.TileSize != 0 && p.TileSize != 8*p.TileBytes {
@@ -524,6 +685,12 @@ func (p *FragParams) compile(word, _ int) error {
 	}
 	if p.Retransmission == 0 {
 		p.Retransmission = Duration(p.Inactivity.D() / time.Duration(p.MaxAckRequests+1))
+	}
+	if (p.CompoundAck || p.LastBitmapUncompressed) && p.Mode != AckOnError {
+		return errors.New("compoundAck is for ack-on-error (RFC 9441)")
+	}
+	if p.LastBitmapUncompressed && !p.CompoundAck {
+		return errors.New("lastBitmapUncompressed goes with compoundAck")
 	}
 	switch p.Mode {
 	case NoAck:
@@ -550,8 +717,10 @@ func (p *FragParams) compile(word, _ int) error {
 		if p.WindowSize < 1 || p.WindowSize >= 1<<uint(p.FCNSize) {
 			return errors.New("windowSize must be less than 2^fcnSize")
 		}
-		if p.TileSize < word {
-			return fmt.Errorf("ack-on-error needs a tile size of at least one L2 Word (%d bits)", word)
+		// Tile size 0: each tile fills its fragment (RFC 9363 tile-size
+		// absent), cut at the MTU the sender starts with.
+		if p.TileSize < 0 || (p.TileSize > 0 && p.TileSize < word) {
+			return fmt.Errorf("ack-on-error needs a tile size of at least one L2 Word (%d bits), or 0 for tiles that fill their fragment", word)
 		}
 		if p.PenultimateShort && p.TileSize < 2*word {
 			return errors.New("a penultimate tile one L2 Word short needs tiles of two L2 Words or more")

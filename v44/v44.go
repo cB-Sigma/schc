@@ -2,7 +2,32 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package v44 is the ITU-T V.44 (11/2000, with Corrigendum 1 of 03/2002)
-// data compression algorithm, packet method (annex B.1), in pure Go.
+// data compression algorithm in pure Go: the packet method (annex B.1,
+// Compress and Decompress), the multi-packet method (annex B.2) and the
+// stream method of the main body (Encoder and Decoder), and the
+// negotiation of annex A and 7.4 (Proposal, MarshalXID, ParseXID, Agree,
+// parameter mode).
+//
+// Multi-packet and stream (stream.go): the dictionary and history last
+// from packet to packet, or along the stream. Each packet ends with FLUSH
+// and octet alignment; the character after a FLUSH is appended to the
+// string before it (7.13, Table 2), as the appendix II encoder does ahead
+// of that character's arrival. A full node-tree (7.11.3) or history (7.11.4) brings
+// REINIT, mid-packet if need be; N2 defaults to 1024 and N8 to 3 × N2
+// (Table 10). After a multi-packet packet sent uncompressed both ends
+// start a new dictionary (B.2.1). The stream encoder holds back N7
+// characters of look-ahead until Flush, so that its codes are those of
+// the whole stream; its decoder takes input in pieces of any size. The
+// stream also has transparent mode (6.5) with the ESCAPE of 7.14, an
+// optional compressibility monitor (7.11.5, Encoder.Auto) and parameter
+// mode (7.4.2). V.44 itself has no test vectors for these methods; they
+// are tested by round trip, the appendix II.1 sequence continued across a
+// FLUSH, and the codes and octets the clauses define.
+//
+// Negotiation (xid.go): the V.44 parameters of Table 10 as an XID user
+// data subfield (annex A) or a parameter-mode sequence, and the agreement
+// rules of 7.4 and annex B (lesser values, directions, method). The V.42
+// LAPM procedures that carry the XID frame are not part of this package.
 //
 // Each call to Compress or Decompress is one packet: the dictionaries start
 // in their initial state (7.5.1, 7.5.2), the encoder ends the packet with a
@@ -40,8 +65,8 @@
 // as the multi-packet method does when its history fills (B.2.1, 7.11.4).
 // The decoder also honours REINIT wherever it appears. The initial
 // codeword size (6 bits) and ordinal size (7 bits) are fixed by 7.5 and are
-// not parameters. Transparent mode (6.5) is not part of the packet method
-// (annex B) and is not built; neither is the stream method.
+// not parameters. Transparent mode (6.5) is not part of the packet methods
+// (annex B); the stream method has it.
 //
 // The decoder never panics on bad input and always ends: every code
 // consumes at least one bit, and the output is bounded by Params.Limit.

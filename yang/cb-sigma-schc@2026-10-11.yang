@@ -1,0 +1,156 @@
+module cb-sigma-schc {
+  yang-version 1.1;
+  namespace "urn:cb-sigma:params:xml:ns:yang:cb-sigma-schc";
+  prefix sigschc;
+
+  import ietf-schc {
+    prefix schc;
+    reference
+      "RFC 9363";
+  }
+
+  organization
+    "cB-Sigma";
+  contact
+    "https://github.com/cB-Sigma/schc";
+  description
+    "Identities that github.com/cB-Sigma/schc writes in RFC 9363 rule
+     sets for what ietf-schc has no identity for: the IEC 62056-4-7
+     wrapper header fields, CoAP options registered after RFC 9363,
+     variable lengths counted in bits, and RCS algorithms besides CRC32.
+
+     Copyright 2026 Abhinav Gautam. Licensed under the Apache License,
+     Version 2.0.";
+
+  revision 2026-10-11 {
+    description
+      "First revision.";
+  }
+
+  // Field IDs: the IEC 62056-4-7 wrapper header (DLMS/COSEM over UDP).
+
+  identity fid-wrapper-base-type {
+    base schc:fid-base-type;
+    description
+      "Fields of the IEC 62056-4-7 wrapper header.";
+  }
+
+  identity fid-wrapper-version {
+    base fid-wrapper-base-type;
+    description
+      "Wrapper version, 16 bits.";
+  }
+
+  identity fid-wrapper-dev-wport {
+    base fid-wrapper-base-type;
+    description
+      "The device's wPort, 16 bits: the source going up.";
+  }
+
+  identity fid-wrapper-app-wport {
+    base fid-wrapper-base-type;
+    description
+      "The application's wPort, 16 bits.";
+  }
+
+  identity fid-wrapper-length {
+    base fid-wrapper-base-type;
+    description
+      "Length of the APDU that follows, 16 bits.";
+  }
+
+  // Field IDs: CoAP options registered after RFC 9363.
+
+  identity fid-coap-option-hop-limit {
+    base schc:fid-coap-option;
+    description
+      "CoAP option 16.";
+    reference
+      "RFC 8768";
+  }
+
+  identity fid-coap-option-q-block1 {
+    base schc:fid-coap-option;
+    description
+      "CoAP option 19.";
+    reference
+      "RFC 9177";
+  }
+
+  identity fid-coap-option-q-block2 {
+    base schc:fid-coap-option;
+    description
+      "CoAP option 31.";
+    reference
+      "RFC 9177";
+  }
+
+  identity fid-coap-option-edhoc {
+    base schc:fid-coap-option;
+    description
+      "CoAP option 21.";
+    reference
+      "RFC 9668";
+  }
+
+  identity fid-coap-option-echo {
+    base schc:fid-coap-option;
+    description
+      "CoAP option 252.";
+    reference
+      "RFC 9175";
+  }
+
+  identity fid-coap-option-request-tag {
+    base schc:fid-coap-option;
+    description
+      "CoAP option 292.";
+    reference
+      "RFC 9175";
+  }
+
+  identity fid-coap-option-ocf-accept-content-format-version {
+    base schc:fid-coap-option;
+    description
+      "CoAP option 2049.";
+  }
+
+  identity fid-coap-option-ocf-content-format-version {
+    base schc:fid-coap-option;
+    description
+      "CoAP option 2053.";
+  }
+
+  // Field length functions.
+
+  identity fl-variable-bits {
+    base schc:fl-base-type;
+    description
+      "Variable length whose residue size is counted in bits
+       (RFC 8724 7.4.2), where fl-variable counts bytes.";
+  }
+
+  // RCS algorithms.
+
+  identity rcs-crc32c {
+    base schc:rcs-algorithm-base-type;
+    description
+      "CRC-32C (Castagnoli), 32 bits.";
+    reference
+      "RFC 3720 B.4";
+  }
+
+  identity rcs-crc16-hdlc {
+    base schc:rcs-algorithm-base-type;
+    description
+      "The 16-bit frame check sequence of HDLC, 16 bits.";
+    reference
+      "RFC 1662 C.2";
+  }
+
+  identity rcs-crc8 {
+    base schc:rcs-algorithm-base-type;
+    description
+      "CRC-8 with polynomial 07h and initial value 0, 8 bits.";
+  }
+}

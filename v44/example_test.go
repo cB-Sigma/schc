@@ -26,3 +26,19 @@ func ExampleCompress() {
 	// 420 -> true
 	// true <nil>
 }
+
+// The multi-packet method (annex B.2): the second packet, like the first,
+// costs little because the dictionary remembers the first.
+func ExampleNewEncoder() {
+	enc, _ := v44.NewEncoder(v44.MultiPacket, v44.Params{})
+	dec, _ := v44.NewDecoder(v44.MultiPacket, v44.Params{})
+	pkt := []byte(`{"meter":"0-0:96.1.0.255","voltage":230.1,"current":4.2}`)
+	for i := 0; i < 2; i++ {
+		c := enc.Packet(pkt)
+		back, err := dec.Packet(c)
+		fmt.Println(len(pkt), "->", len(c), bytes.Equal(back, pkt), err)
+	}
+	// Output:
+	// 56 -> 52 true <nil>
+	// 56 -> 4 true <nil>
+}

@@ -1,7 +1,8 @@
 schc
 Copyright 2026 Abhinav Gautam
 
-SCHC header compression and fragmentation, and V.44 compression, in Go.
+SCHC header compression and fragmentation, rules in the RFC 9363 data
+model, and V.44 compression, in Go.
 
 This module is licensed under the Apache License, Version 2.0 (LICENSE).
 
@@ -14,4 +15,17 @@ above; newer files carry "Copyright 2026 Abhinav Gautam" and
 Published values and test vectors are used as facts and cited where used;
 no specification text is reproduced (see PROVENANCE.md).
 
-Dependencies: none outside the Go standard library.
+Third-party data (not code), from openschc
+(https://github.com/openschc/openschc, commit 58293f71), under the MIT
+licence, "Copyright (c) 2018 OpenSCHC XXX" and "Copyright (c) 2017-2018
+Shoichi Sakane" as its LICENSE states them; the licence text is next to
+each file:
+
+- testdata/openschc/schc.json: an example rule set, used as a test input.
+- coreconf/sid/ietf-schc@2023-01-28.sid and
+  coreconf/sid/ietf-schc-oam@2021-11-10.sid: SID assignments, embedded in
+  the coreconf package as its default SIDs.
+
+Dependencies: the schc and schc/v44 packages use only the Go standard
+library. The schc/coreconf package uses github.com/fxamacker/cbor/v2
+(MIT), which uses github.com/x448/float16 (MIT).

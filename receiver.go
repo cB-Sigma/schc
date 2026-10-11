@@ -186,7 +186,7 @@ func (rv *Receiver) noAck(m *FragMsg) ([]Bits, error) {
 	for _, t := range rv.seq {
 		pkt.Append(t)
 	}
-	if rcs(pkt) != m.RCS {
+	if rv.p.rcs(pkt) != m.RCS {
 		rv.err = errors.New("schc: the integrity check failed")
 		return nil, rv.err
 	}
@@ -262,7 +262,7 @@ func (rv *Receiver) aaCheck(rcsGot uint32) bool {
 			pkt.Append(t)
 		}
 	}
-	if rcs(pkt) != rcsGot {
+	if rv.p.rcs(pkt) != rcsGot {
 		return false
 	}
 	rv.packet = pkt
@@ -388,7 +388,10 @@ func (rv *Receiver) aoe(m *FragMsg) []Bits {
 		}
 		t := rv.tileNo(m.W, m.FCN)
 		pl := m.Payload
-		k := pl.Len() / ts
+		k := -1
+		if ts > 0 {
+			k = pl.Len() / ts
+		}
 		var events []uint32 // windows to acknowledge (ackEveryWindow)
 		put := func(n int, b Bits) {
 			if n >= limit {
@@ -405,10 +408,15 @@ func (rv *Receiver) aoe(m *FragMsg) []Bits {
 				events = append(events, w)
 			}
 		}
+		if ts == 0 {
+			// Tiles fill their fragment (RFC 9363 tile-size absent): the
+			// payload is one tile, with any padding of the last.
+			put(t, pl)
+		}
 		for i := 0; i < k; i++ {
 			put(t+i, pl.Slice(i*ts, (i+1)*ts))
 		}
-		if left := pl.Len() - k*ts; left >= rv.word {
+		if left := pl.Len() - k*ts; k >= 0 && left >= rv.word {
 			// A shorter tile at the end: the last tile (with its
 			// padding), or a penultimate one L2 Word short.
 			put(t+k, pl.Slice(k*ts, pl.Len()))
@@ -434,7 +442,10 @@ func (rv *Receiver) aoe(m *FragMsg) []Bits {
 	case MsgAll1:
 		if !rv.all1 {
 			rv.all1, rv.all1W, rv.rcsGot = true, m.W, m.RCS
-			if m.Payload.Len() >= rv.word {
+			if m.Payload.Len() > 0 {
+				// Fewer bits than an L2 Word may be padding or a last tile
+				// that short (the sender puts such a tile in the All-1):
+				// check tells them apart by the RCS.
 				t := m.Payload
 				rv.all1T = &t
 			}
@@ -470,9 +481,17 @@ func (rv *Receiver) check() bool {
 		pkt.Append(t)
 	}
 	if rv.all1T != nil {
-		pkt.Append(*rv.all1T)
+		with := pkt.Clone()
+		with.Append(*rv.all1T)
+		if rv.p.rcs(with) == rv.rcsGot {
+			rv.packet, rv.done = with, true
+			return true
+		}
+		if rv.all1T.Len() >= rv.word {
+			return false // a whole tile, not padding
+		}
 	}
-	if rcs(pkt) != rv.rcsGot {
+	if rv.p.rcs(pkt) != rv.rcsGot {
 		return false
 	}
 	rv.packet, rv.done = pkt, true
@@ -518,15 +537,31 @@ func (rv *Receiver) respond() []Bits {
 	if rv.all1 && rv.all1W > last {
 		last = rv.all1W
 	}
+	var missing []uint32
 	for w := uint32(0); w <= last; w++ {
 		if rv.missingIn(w) {
-			return rv.aoeAck(w, false)
+			if !rv.p.CompoundAck {
+				return rv.aoeAck(w, false)
+			}
+			missing = append(missing, w)
 		}
+	}
+	if rv.p.CompoundAck && rv.all1 && (len(missing) == 0 || missing[len(missing)-1] < rv.all1W) {
+		// The check failed with the All-1 in: the last window misses
+		// tiles too, as RFC 9441 figure 7 reports it.
+		missing = append(missing, rv.all1W)
+	}
+	if len(missing) > 0 {
+		// One SCHC Compound ACK for every window with tiles missing,
+		// lowest first (RFC 9441 3.2.1.2).
+		return rv.aoeAck(missing[0], false, missing[1:]...)
 	}
 	return rv.aoeAck(last, false)
 }
 
-func (rv *Receiver) aoeAck(w uint32, c bool) []Bits {
+// aoeAck acknowledges window w (C=1, or C=0 with its bitmap) and, in a
+// Compound ACK, the further windows more.
+func (rv *Receiver) aoeAck(w uint32, c bool, more ...uint32) []Bits {
 	if rv.attempts >= rv.p.MaxAckRequests {
 		if rv.done {
 			return nil
@@ -536,6 +571,16 @@ func (rv *Receiver) aoeAck(w uint32, c bool) []Bits {
 	if c {
 		return []Bits{rv.ackMsg(w, true, nil)}
 	}
+	m := &FragMsg{Kind: MsgAck, W: w, Bitmap: rv.aoeBitmap(w)}
+	for _, x := range more {
+		m.More = append(m.More, WindowBitmap{W: x, Bitmap: rv.aoeBitmap(x)})
+	}
+	rv.attempts++
+	return []Bits{rv.enc(m)}
+}
+
+// aoeBitmap is window w's bitmap of received tiles.
+func (rv *Receiver) aoeBitmap(w uint32) []bool {
 	ws := rv.p.WindowSize
 	bm := make([]bool, ws)
 	for i := 0; i < ws; i++ {
@@ -544,5 +589,5 @@ func (rv *Receiver) aoeAck(w uint32, c bool) []Bits {
 	if rv.all1 && w == rv.all1W {
 		bm[ws-1] = true // the All-1 was received (RFC 8724 figure 32)
 	}
-	return []Bits{rv.ackMsg(w, false, bm)}
+	return bm
 }
