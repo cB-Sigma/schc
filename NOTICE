@@ -1,0 +1,17 @@
+schc
+Copyright 2026 Abhinav Gautam
+
+SCHC header compression and fragmentation, and V.44 compression, in Go.
+
+This module is licensed under the Apache License, Version 2.0 (LICENSE).
+
+The code was written for SigmaM2M from the published specifications listed
+in PROVENANCE.md. It contains no code from other projects. Source files
+without a per-file copyright header are covered by the copyright line
+above; newer files carry "Copyright 2026 Abhinav Gautam" and
+"SPDX-License-Identifier: Apache-2.0".
+
+Published values and test vectors are used as facts and cited where used;
+no specification text is reproduced (see PROVENANCE.md).
+
+Dependencies: none outside the Go standard library.
